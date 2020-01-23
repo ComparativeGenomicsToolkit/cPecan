@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Add scoring-related parameters to a lastz scores file
 -----------------------------------------------------
@@ -26,7 +26,7 @@ import sys
 def usage(s=None):
 	message = """
 expand_scores_file [options]< scores_file > scores_file
-  --overridegaps  ignore gap scores already set 
+  --overridegaps  ignore gap scores already set
 """
 
 	if (s == None): sys.exit (message)
@@ -100,10 +100,10 @@ def main():
 				subs[rowCh+colCh] = int_or_float(fields[ix])
 
 	if (subs == None):
-		raise "scores file is missing a matrix"
+		raise Exception("scores file is missing a matrix")
 
 	if ("AA" not in subs):
-		raise "scores file lacks A-to-A score"
+		raise Exception("scores file lacks A-to-A score")
 
 	# compute a few values from the scores matrix
 
@@ -117,19 +117,19 @@ def main():
 
 	if ("O" not in nameToVal):
 		nameToVal["O"] = -int(3.25 * worstSub)
-		
+
 	if ("E" not in nameToVal):
 		nameToVal["E"] = -int(0.25 * worstSub)
-		
+
 	if ("X" not in nameToVal):
 		nameToVal["X"] = int(10 * aaSub)
-		
+
 	if ("Y" not in nameToVal):
 		nameToVal["Y"] = int(nameToVal["O"] + 100*nameToVal["E"])
-		
+
 	if ("K" not in nameToVal):
 		nameToVal["K"] = int(30 * bestSub)
-		
+
 	if ("L" not in nameToVal):
 		nameToVal["L"] = int(30 * bestSub)
 
@@ -153,22 +153,22 @@ def main():
 	blankLine = False
 
 	for ix in range(numValueLines):
-		print lines[ix]
+		print(lines[ix])
 		blankLine = (lines[ix] == "")
 
 	if (addedNames != []):
-		if (not blankLine): print ""
-		print "# (score parameters added by expand_scores_file)"
-		print ""
+		if (not blankLine): print("")
+		print("# (score parameters added by expand_scores_file)")
+		print("")
 
 		for name in addedNames:
-			print "%s=%s" % (name,nameToVal[name])
+			print("%s=%s" % (name,nameToVal[name]))
 
 		blankLine = (lines[numValueLines] == "")
-		if (not blankLine): print ""
+		if (not blankLine): print("")
 
 	for ix in range(numValueLines,len(lines)):
-		print lines[ix]
+		print(lines[ix])
 
 
 def int_or_float(s):

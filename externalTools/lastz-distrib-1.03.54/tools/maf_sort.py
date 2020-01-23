@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Sort alignment blocks in a maf file, according to the user's choice of key
 --------------------------------------------------------------------------
@@ -55,9 +55,9 @@ def main():
 		if (keyReverse): blocks.reverse()
 		for (key,block,comments) in blocks:
 			if (comments != []):
-				print "\n".join([line for line in comments])
-			print "\n".join([line for line in block])
-			print
+				print("\n".join([line for line in comments]))
+			print("\n".join([line for line in block]))
+			print()
 
 
 # read_blocks--

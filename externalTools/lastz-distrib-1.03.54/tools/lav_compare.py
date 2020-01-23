@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Compare two lav files, reporting differences but ignoring some trivial ones
 ---------------------------------------------------------------------------
@@ -79,12 +79,12 @@ def main():
 			stanzaIx = 0
 
 	if (different):
-		print >>sys.stderr,"FAILURE: %s and %s are different (line %d)" \
-		                 % (lav1Filename,lav2Filename,lineNum)
+		print("FAILURE: %s and %s are different (line %d)" \
+		                 % (lav1Filename,lav2Filename,lineNum), file=sys.stderr)
 		sys.exit(1)
 
-	print >>sys.stderr,"SUCCESS: %s and %s are equivalent" \
-					 % (lav1Filename,lav2Filename)
+	print("SUCCESS: %s and %s are equivalent" \
+					 % (lav1Filename,lav2Filename), file=sys.stderr)
 
 
 def header_strip(s):

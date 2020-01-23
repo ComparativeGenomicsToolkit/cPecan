@@ -11,31 +11,33 @@ from cPecan.cPecanRealignTest import seqFilePairGenerator
 from cPecan.common import runCPecanEm
 from cPecan.cPecanEm import Hmm, writeLastzScoringMatrix, makeBlastScoringMatrix
 
+raise Exception("cPecanEmTest.py does not current work and is only partially ported to py3 and toil")
+
 class TestCase(unittest.TestCase):
     def setUp(self):
         unittest.TestCase.setUp(self)
-    
+
     def tearDown(self):
         unittest.TestCase.tearDown(self)
 
     def testCPecanEm(self):
-        """Runs cPecanEm. 
+        """Runs cPecanEm.
         """
         trial = 0
         for modelType in ("fiveState", "fiveStateAsymmetric", "threeState", "threeStateAsymmetric"):
             for seqFile1, seqFile2 in seqFilePairGenerator():
                 tempDir = getTempDirectory(rootDir=os.getcwd())
-                jobTreeDir = os.path.join(tempDir, "jobTree")
+                jobStore = os.path.join(tempDir, "jobStore")
                 alignmentsFile = os.path.join(tempDir, "alignments.cigars")
                 computeAlignments(seqFile1, seqFile2, alignmentsFile)
                 logger.info("Computed alignments for seqs %s and %s" % (seqFile1, seqFile2))
                 outputModelFile = os.path.join(tempDir, "outputModel.txt")
-                #First run the script to generate a model and do one iteration of EM to 
+                #First run the script to generate a model and do one iteration of EM to
                 #get the likelihood to compare with the final likelihood
-                runCPecanEm(sequenceFiles=[ seqFile1, seqFile2 ], 
-                             alignmentsFile=alignmentsFile, outputModelFile=outputModelFile, 
+                runCPecanEm(sequenceFiles=[ seqFile1, seqFile2 ],
+                             alignmentsFile=alignmentsFile, outputModelFile=outputModelFile,
                              modelType=modelType,
-                             jobTreeDir=jobTreeDir,
+                             jobStore=jobStore,
                              iterations=1, trials=1, randomStart=False, logLevel=getLogLevelString(),
                              setJukesCantorStartingEmissions=0.2,
                              #useDefaultModelAsStart=,
@@ -43,11 +45,11 @@ class TestCase(unittest.TestCase):
                              tieEmissions=True,
                              optionsToRealign="--diagonalExpansion=6 --splitMatrixBiggerThanThis=100")
                 hmm = Hmm.loadHmm(outputModelFile)
-                system("rm -rf %s" % jobTreeDir) #Cleanup the old jobTree
+                # FIXME: be careful here: system("rm -rf %s" % jobStore) #Cleanup the old jobStore
                 logger.info("For trial %s the likelihood after 1 iteration of EM is %s" % (trial, hmm.likelihood))
                 iterations = 5
-                runCPecanEm(sequenceFiles=[ seqFile1, seqFile2 ], 
-                            alignmentsFile=alignmentsFile, outputModelFile=outputModelFile, jobTreeDir=jobTreeDir,
+                runCPecanEm(sequenceFiles=[ seqFile1, seqFile2 ],
+                            alignmentsFile=alignmentsFile, outputModelFile=outputModelFile, jobStore=jobStore,
                             optionsToRealign="--diagonalExpansion=6 --splitMatrixBiggerThanThis=100",
                             iterations=iterations, inputModelFile=outputModelFile, logLevel=getLogLevelString(),
                             maxAlignmentLengthPerJob=10000) #, updateTheBand=True)
@@ -59,52 +61,52 @@ class TestCase(unittest.TestCase):
                 logger.info("Final emissions: %s" % " ".join(map(str, hmm2.emissions)))
                 system("rm -rf %s" % tempDir)
                 trial += 1
-    
+
     def testCPecanEmMultipleTrials(self):
         """Runs uns cPecanEm with multiple different trials.
         """
         for seqFile1, seqFile2 in seqFilePairGenerator():
             tempDir = getTempDirectory(rootDir=os.getcwd())
-            jobTreeDir = os.path.join(tempDir, "jobTree")
+            jobStore = os.path.join(tempDir, "jobStore")
             alignmentsFile = os.path.join(tempDir, "alignments.cigars")
             computeAlignments(seqFile1, seqFile2, alignmentsFile)
             logger.info("Computed alignments for seqs %s and %s" % (seqFile1, seqFile2))
             outputModelFile = os.path.join(tempDir, "outputModel.txt")
             outputModelXMLFile = os.path.join(tempDir, "outputModel.xml")
             outputBlastFile = os.path.join(tempDir, "outputBlast.txt")
-            #First run the script to generate a model and do one iteration of EM to 
+            #First run the script to generate a model and do one iteration of EM to
             #get the likelihood to compare with the final likelihood
             trials=3
-            runCPecanEm(sequenceFiles=[ seqFile1, seqFile2 ], 
-                         alignmentsFile=alignmentsFile, outputModelFile=outputModelFile, 
-                         jobTreeDir=jobTreeDir,
-                         trials=trials,
-                         outputTrialHmms=True,
-                         iterations=5, randomStart=True, logLevel=getLogLevelString(),
-                         optionsToRealign="--diagonalExpansion=6 --splitMatrixBiggerThanThis=100",
-                         outputXMLModelFile=outputModelXMLFile,
-                         blastScoringMatrixFile=outputBlastFile)
-            trialHmms = [ Hmm.loadHmm(outputModelFile + ("_%i" % i)) for i in xrange(trials) ]
+            runCPecanEm(sequenceFiles=[ seqFile1, seqFile2 ],
+                        alignmentsFile=alignmentsFile, outputModelFile=outputModelFile,
+                        jobStore=jobStore,
+                        trials=trials,
+                        outputTrialHmms=True,
+                        iterations=5, randomStart=True, logLevel=getLogLevelString(),
+                        optionsToRealign="--diagonalExpansion=6 --splitMatrixBiggerThanThis=100",
+                        outputXMLModelFile=outputModelXMLFile,
+                        blastScoringMatrixFile=outputBlastFile)
+            trialHmms = [ Hmm.loadHmm(outputModelFile + ("_%i" % i)) for i in range(trials) ]
             hmm = Hmm.loadHmm(outputModelFile)
             node = ET.parse(outputModelXMLFile).getroot()
-            logger.info("After multiple trials and iterations of EM the best likelihood found was %s, the likelihoods of the variants were: %s" % 
-                        (hmm.likelihood, " ".join(map(lambda x : str(x.likelihood), trialHmms))))
-            
+            logger.info("After multiple trials and iterations of EM the best likelihood found was %s, the likelihoods of the variants were: %s" %
+                        (hmm.likelihood, " ".join([str(x.likelihood) for x in trialHmms])))
+
             matchProbs, gapOpen, gapExtend = makeBlastScoringMatrix(hmm, ("ACTG",))
             logger.info("Gap open: %s, Gap extend: %s, Match probs %s" % (gapOpen, gapExtend, " ".join(map(str, matchProbs))))
-            
+
             self.assertTrue(float(node.attrib["maxLikelihood"]) == hmm.likelihood)
-            
+
             #Now use the blast file to compute a new matrix
             computeAlignments(seqFile1, seqFile2, alignmentsFile, lastzArguments=("--ambiguous=iupac --scores=%s" % outputBlastFile))
-            
+
             #Run modifyHmm to check it works
             system("cPecanModifyHmm %s %s --gcContent=0.5 --substitutionRate=0.05 --setFlatIndelEmissions" % (outputModelFile, outputModelFile))
             hmm = Hmm.loadHmm(outputModelFile)
             node = ET.parse(outputModelXMLFile).getroot()
-            
+
             system("rm -rf %s" % tempDir)
-    
+
     def testHMMToBlast(self):
         hmmFile = getTempFile()
         fH = open(hmmFile, 'w')
@@ -117,13 +119,12 @@ class TestCase(unittest.TestCase):
         writeLastzScoringMatrix(sys.stdout, matchProbs, gapOpen, gapExtend)
         logger.info("Gap open: %s, Gap extend: %s, Match probs %s" % (gapOpen, gapExtend, " ".join(map(str, matchProbs))))
 
-def computeAlignments(seqFile1, seqFile2, alignmentsFile, lastzArguments="--ambiguous=iupac"):  
+def computeAlignments(seqFile1, seqFile2, alignmentsFile, lastzArguments="--ambiguous=iupac"):
     system("cPecanLastz --format=cigar %s %s[multiple][nameparse=darkspace] %s[nameparse=darkspace] > %s" % (lastzArguments, seqFile1, seqFile2, alignmentsFile))
 
 def main():
     parseSuiteTestOptions()
     unittest.main()
-        
+
 if __name__ == '__main__':
     main()
-

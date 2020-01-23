@@ -1,13 +1,14 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 from cPecan.cPecanEm import Hmm, SYMBOL_NUMBER
 import sys
 import numpy as np
 from optparse import OptionParser
+from functools import reduce
 
 """Modifies an HMM model trained with margin align.
 """
 
-toMatrix = lambda e : map(lambda i : e[SYMBOL_NUMBER*i:SYMBOL_NUMBER*(i+1)], xrange(SYMBOL_NUMBER))
+toMatrix = lambda e : [e[SYMBOL_NUMBER*i:SYMBOL_NUMBER*(i+1)] for i in range(SYMBOL_NUMBER)]
 fromMatrix = lambda e : reduce(lambda x, y : list(x) + list(y), e)
     
 def normaliseHmmByReferenceGCContent(hmm, gcContent):
@@ -15,11 +16,11 @@ def normaliseHmmByReferenceGCContent(hmm, gcContent):
     for state in range(hmm.stateNumber):
         if state not in (2, 4): #Don't normalise GC content of insert states (as they don't have any ref bases!)
             n = toMatrix(hmm.emissions[(SYMBOL_NUMBER**2) * state:(SYMBOL_NUMBER**2) * (state+1)])
-            hmm.emissions[(SYMBOL_NUMBER**2) * state:(SYMBOL_NUMBER**2) * (state+1)] = fromMatrix(map(lambda i : map(lambda j : (n[i][j]/sum(n[i])) * (gcContent/2.0 if i in [1, 2] else (1.0-gcContent)/2.0), range(SYMBOL_NUMBER)), range(SYMBOL_NUMBER))) #Normalise
+            hmm.emissions[(SYMBOL_NUMBER**2) * state:(SYMBOL_NUMBER**2) * (state+1)] = fromMatrix([[(n[i][j]/sum(n[i])) * (gcContent/2.0 if i in [1, 2] else (1.0-gcContent)/2.0) for j in range(SYMBOL_NUMBER)] for i in range(SYMBOL_NUMBER)]) #Normalise
 
 def modifyHmmEmissionsByExpectedVariationRate(hmm, substitutionRate):
     #Normalise background emission frequencies, if requested to GC% given
-    n = toMatrix(map(lambda i : (1.0-substitutionRate) if i % SYMBOL_NUMBER == i / SYMBOL_NUMBER else substitutionRate/(SYMBOL_NUMBER-1), xrange(SYMBOL_NUMBER**2)))
+    n = toMatrix([(1.0-substitutionRate) if i % SYMBOL_NUMBER == i / SYMBOL_NUMBER else substitutionRate/(SYMBOL_NUMBER-1) for i in range(SYMBOL_NUMBER**2)])
     hmm.emissions[:SYMBOL_NUMBER**2] = fromMatrix(np.dot(toMatrix(hmm.emissions[:SYMBOL_NUMBER**2]), n))
 
 def setHmmIndelEmissionsToBeFlat(hmm):
