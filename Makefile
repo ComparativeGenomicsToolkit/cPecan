@@ -5,44 +5,43 @@ libSources = impl/*.c
 libHeaders = inc/*.h
 libTests = tests/*.c
 
-cPecanDependencies =  ${basicLibsDependencies}
-cPecanLibs = ${basicLibs}
-cflags += -Wno-overlength-strings
+cPecanDependencies =  ${LIBDEPENDS}
+cPecanLibs = ${LDLIBS}
+CFLAGS += -Wno-overlength-strings
 
-all : ${libPath}/cPecanLib.a ${binPath}/cPecanLibTests ${binPath}/cPecanRealign ${binPath}/cPecanEm ${binPath}/cPecanModifyHmm ${binPath}/cPecanAlign
+all : ${LIBDIR}/cPecanLib.a ${BINDIR}/cPecanLibTests ${BINDIR}/cPecanRealign ${BINDIR}/cPecanEm ${BINDIR}/cPecanModifyHmm ${BINDIR}/cPecanAlign
 	cd externalTools && ${MAKE} all
 
 clean : 
-	rm -f ${binPath}/cPecanRealign ${binPath}/cPecanEm ${binPath}/cPecanLibTests  ${libPath}/cPecanLib.a
+	rm -f ${BINDIR}/cPecanRealign ${BINDIR}/cPecanEm ${BINDIR}/cPecanLibTests  ${LIBDIR}/cPecanLib.a
 	cd externalTools && ${MAKE} clean
-	rm -rf tmp_*
+	rm -rf tmp_* *.o
 
 export PYTHONPATH = ../sonLib/src:..
 export PATH := ../sonLib/bin:${PATH}
 test : all
 	${PYTHON} allTests.py
 
-${binPath}/cPecanRealign : cPecanRealign.c ${libPath}/cPecanLib.a ${cPecanDependencies} 
-	${cxx} ${cflags} -I inc -I${libPath} -o ${binPath}/cPecanRealign cPecanRealign.c ${libPath}/cPecanLib.a ${cPecanLibs}
+${BINDIR}/cPecanRealign : cPecanRealign.c ${LIBDIR}/cPecanLib.a ${cPecanDependencies} 
+	${CC} ${CPPFLAGS} ${CFLAGS} ${LDFLAGS} -o ${BINDIR}/cPecanRealign cPecanRealign.c ${LIBDIR}/cPecanLib.a ${cPecanLibs} ${LDLIBS}
 
-${binPath}/cPecanEm : cPecanEm.py
-	cp cPecanEm.py ${binPath}/cPecanEm
-	chmod +x ${binPath}/cPecanEm
+${BINDIR}/cPecanEm : cPecanEm.py
+	cp cPecanEm.py ${BINDIR}/cPecanEm
+	chmod +x ${BINDIR}/cPecanEm
 
-${binPath}/cPecanModifyHmm : cPecanModifyHmm.py
-	cp cPecanModifyHmm.py ${binPath}/cPecanModifyHmm
-	chmod +x ${binPath}/cPecanModifyHmm
+${BINDIR}/cPecanModifyHmm : cPecanModifyHmm.py
+	cp cPecanModifyHmm.py ${BINDIR}/cPecanModifyHmm
+	chmod +x ${BINDIR}/cPecanModifyHmm
 
-${binPath}/cPecanAlign : cPecanAlign.c ${libPath}/cPecanLib.a ${cPecanDependencies} 
-	${cxx} ${cflags} -I inc -I${libPath} -o ${binPath}/cPecanAlign cPecanAlign.c ${libPath}/cPecanLib.a ${cPecanLibs}
+${BINDIR}/cPecanAlign : cPecanAlign.c ${LIBDIR}/cPecanLib.a ${cPecanDependencies} 
+	${CC} ${CPPFLAGS} ${CFLAGS} ${LDFLAGS} -o ${BINDIR}/cPecanAlign cPecanAlign.c ${LIBDIR}/cPecanLib.a ${cPecanLibs} ${LDLIBS}
 
-${binPath}/cPecanLibTests : ${libTests} ${libPath}/cPecanLib.a ${cPecanDependencies}
-	${cxx} ${cflags} -I inc -I${libPath} -Wno-error -o ${binPath}/cPecanLibTests ${libTests} ${libPath}/cPecanLib.a ${cPecanLibs}
+${BINDIR}/cPecanLibTests : ${libTests} ${LIBDIR}/cPecanLib.a ${cPecanDependencies}
+	${CC} ${CPPFLAGS} ${CFLAGS} ${LDFLAGS} -Wno-error -o ${BINDIR}/cPecanLibTests ${libTests} ${LIBDIR}/cPecanLib.a ${cPecanLibs} ${LDLIBS}
 
-${libPath}/cPecanLib.a : ${libSources} ${libHeaders} ${stBarDependencies}
-	${cxx} ${cflags} -I inc -I ${libPath}/ -c ${libSources} 
-	ar rc cPecanLib.a *.o
-	ranlib cPecanLib.a 
-	rm *.o
-	mv cPecanLib.a ${libPath}/
-	cp ${libHeaders} ${libPath}/
+${LIBDIR}/cPecanLib.a : ${libSources} ${libHeaders} ${stBarDependencies}
+	${CC} ${CPPFLAGS} ${CFLAGS} -I inc -I ${LIBDIR}/ -c ${libSources} 
+	${AR} rc cPecanLib.a *.o
+	${RANLIB} cPecanLib.a 
+	mv cPecanLib.a ${LIBDIR}/
+	cp ${libHeaders} ${LIBDIR}/
