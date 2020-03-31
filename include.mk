@@ -2,8 +2,8 @@
 sonLibRootDir?=${rootPath}/../sonLib
 sonLibDir=${sonLibRootDir}/lib
 #Use sonLib bin and lib dirs
-BINDIR=${sonLibRootDir}/bin
-LIBDIR=${sonLibDir}
+BINDIR ?= ${sonLibRootDir}/bin
+LIBDIR ?= ${sonLibDir}
 CPPFLAGS +=-I${sonLibRootDir}/C/inc -I${sonLibRootDir}/externalTools/cutest/
 
 include  ${sonLibRootDir}/include.mk
