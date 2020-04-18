@@ -8,6 +8,6 @@ CPPFLAGS +=-I${sonLibRootDir}/C/inc -I${sonLibRootDir}/externalTools/cutest/
 
 include  ${sonLibRootDir}/include.mk
 
-LDLIBS = ${sonLibDir}/sonLib.a ${sonLibDir}/cuTest.a ${dblibs}
+LDLIBS = ${sonLibDir}/sonLib.a ${sonLibDir}/cuTest.a ${dblibs} ${LIBS}
 LIBDEPENDS = ${sonLibDir}/sonLib.a ${sonLibDir}/cuTest.a 
 
