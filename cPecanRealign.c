@@ -239,8 +239,8 @@ char *getSubSequence(char *seq, int64_t start, int64_t end, bool strand) {
     return rSeq;
 }
 
-stHash *sequences = NULL;
-void addToSequencesHash(const char *header, const char *sequence, int64_t length) {
+void addToSequencesHash(void *destination, const char *header, const char *sequence, int64_t length) {
+    stHash *sequences = destination;
     stList *tokens = stString_split(header);
     char *firstToken = stList_get(tokens, 0);
     if (stHash_search(sequences, (char *) firstToken) != NULL) {
@@ -494,11 +494,11 @@ int main(int argc, char *argv[]) {
     }
 
     //Read in input sequences
-    sequences = stHash_construct3(stHash_stringKey, stHash_stringEqualKey, free, free);
+    stHash *sequences = stHash_construct3(stHash_stringKey, stHash_stringEqualKey, free, free);
     assert(optind < argc);
     while (optind < argc) {
         FILE *seqFileHandle = fopen(argv[optind++], "r");
-        fastaReadToFunction(seqFileHandle, addToSequencesHash);
+        fastaReadToFunction(seqFileHandle, sequences, addToSequencesHash);
         fclose(seqFileHandle);
     }
 
