@@ -67,7 +67,7 @@ VERSION_FLAGS= \
 	-DSUBVERSION_REV="\"${SUBVERSION_REV}"\"
 
 
-CFLAGS = -O3 ${definedForAll} ${VERSION_FLAGS}
+CFLAGS += -O3 ${definedForAll} ${VERSION_FLAGS}
 
 
 srcFiles = lastz infer_scores \
@@ -97,13 +97,13 @@ incFiles = lastz.h infer_scores.h \
 
 
 lastz: $(foreach part,${srcFiles},${part}.o)
-	${CC} $(foreach part,${srcFiles},${part}.o) -lm -o $@
+	${CC} $(foreach part,${srcFiles},${part}.o) -lm ${CFLAGS} -o $@
 
 lastz_D: $(foreach part,${srcFiles},${part}_D.o)
-	${CC} $(foreach part,${srcFiles},${part}_D.o) -lm -o $@
+	${CC} $(foreach part,${srcFiles},${part}_D.o) -lm ${CFLAGS} -o $@
 
 lastz_32: $(foreach part,${srcFiles},${part}_32.o)
-	${CC} $(foreach part,${srcFiles},${part}_32.o) -lm -o $@
+	${CC} $(foreach part,${srcFiles},${part}_32.o) -lm ${CFLAGS} -o $@
 
 # cleanup
 
