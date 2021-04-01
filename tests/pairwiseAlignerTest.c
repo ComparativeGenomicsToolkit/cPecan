@@ -13,6 +13,7 @@
 #include <math.h>
 #include <ctype.h>
 #include "randomSequences.h"
+#include "../../sonLib/lib/multipleAligner.h"
 
 void test_diagonal(CuTest *testCase) {
     //Construct an example diagonal.
@@ -479,17 +480,19 @@ void test_getBlastPairs(CuTest *testCase) {
         st_logInfo("Sequence X to align: %s END, seq length %" PRIi64 "\n", seqX, lX);
         st_logInfo("Sequence Y to align: %s END, seq length %" PRIi64 "\n", seqY, lY);
 
-        int64_t trim = st_randomInt(0, 5);
-        int64_t diagonalExpansion = st_randomInt(0, 5)*2;
+        PairwiseAlignmentParameters *p = pairwiseAlignmentBandingParameters_construct();
+        p->constraintDiagonalTrim = st_randomInt(0, 5);
+        p->diagonalExpansion = st_randomInt(0, 5)*2;
         bool repeatMask = st_random() > 0.5;
-        st_logInfo("Using random trim %" PRIi64 ", recursive %" PRIi64 " \n", trim, repeatMask);
+        st_logInfo("Using random trim %" PRIi64 ", recursive %" PRIi64 " \n", p->constraintDiagonalTrim, repeatMask);
 
-        stList *blastPairs = getBlastPairs(seqX, seqY, lX, lY, trim, diagonalExpansion, repeatMask);
+        stList *blastPairs = getBlastPairs(seqX, seqY, lX, lY, p, repeatMask);
 
-        checkBlastPairs(testCase, blastPairs, lX, lY, diagonalExpansion, 0);
+        checkBlastPairs(testCase, blastPairs, lX, lY, p->diagonalExpansion, 0);
         stList_destruct(blastPairs);
         free(seqX);
         free(seqY);
+        pairwiseAlignmentBandingParameters_destruct(p);
     }
 }
 

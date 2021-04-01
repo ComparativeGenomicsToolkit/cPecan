@@ -19,6 +19,11 @@
 #include "pairwiseAlignment.h"
 #include "stateMachine.h"
 
+// OpenMP
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 //The exception string
 extern const char *PAIRWISE_ALIGNMENT_EXCEPTION_ID;
 
@@ -38,6 +43,9 @@ typedef struct _pairwiseAlignmentBandingParameters {
     float gapGamma; //The AMAP gap-gamma parameter which controls the degree to which indel probabilities are factored into the alignment.
     bool dynamicAnchorExpansion; // For each alignment anchor specify the expansion of the band individually, instead of using a
     // single expansion
+#if defined(_OPENMP)
+    omp_lock_t lastzLock; // This lock used to gate access to calling out to lastz
+#endif
 } PairwiseAlignmentParameters;
 
 PairwiseAlignmentParameters *pairwiseAlignmentBandingParameters_construct();
@@ -249,7 +257,7 @@ void getPosteriorProbsWithBanding(StateMachine *sM, stList *anchorPairs, const S
 
 //Blast pairs
 
-stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, int64_t trim, int64_t diagonalExpansion, bool repeatMask);
+stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p, bool repeatMask);
 
 stList *getBlastPairsForPairwiseAlignmentParameters(const char *sX, const char *sY, const int64_t lX, const int64_t lY,
         PairwiseAlignmentParameters *p);

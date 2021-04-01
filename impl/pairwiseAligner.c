@@ -16,6 +16,12 @@
 #include "sonLib.h"
 #include "pairwiseAligner.h"
 #include "pairwiseAlignment.h"
+#include "../../sonLib/lib/multipleAligner.h"
+
+// OpenMP
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 ///////////////////////////////////
 ///////////////////////////////////
@@ -1002,21 +1008,12 @@ stList *convertPairwiseForwardStrandAlignmentToAnchorPairs(struct PairwiseAlignm
     return alignedPairs;
 }
 
-stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, int64_t trim, int64_t diagonalExpansion, bool repeatMask) {
+stList *getBlastPairsP(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p, bool repeatMask) {
     /*
      * Uses lastz to compute a bunch of monotonically increasing pairs such that for any pair of consecutive pairs in the list
      * (x1, y1) (x2, y2) in the set of aligned pairs x1 appears before x2 in X and y1 appears before y2 in Y.
      */
     stList *alignedPairs = stList_construct3(0, (void (*)(void *)) stIntTuple_destruct); //the list to put the output in
-
-    if (lX == 0 || lY == 0) {
-        return alignedPairs;
-    }
-
-    if (!repeatMask) {
-        sX = makeUpperCase(sX, lX);
-        sY = makeUpperCase(sY, lY);
-    }
 
     //Write one sequence to file..
     char *tempFile1 = getTempFile();
@@ -1048,7 +1045,7 @@ stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, in
     while ((pA = cigarRead(fileHandle)) != NULL) {
         assert(strcmp(pA->contig1, "a") == 0);
         assert(strcmp(pA->contig2, "b") == 0);
-        stList *alignedPairsForCigar = convertPairwiseForwardStrandAlignmentToAnchorPairs(pA, trim, diagonalExpansion);
+        stList *alignedPairsForCigar = convertPairwiseForwardStrandAlignmentToAnchorPairs(pA, p->constraintDiagonalTrim, p->diagonalExpansion);
         stList_appendAll(alignedPairs, alignedPairsForCigar);
         stList_setDestructor(alignedPairsForCigar, NULL);
         stList_destruct(alignedPairsForCigar);
@@ -1061,8 +1058,6 @@ stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, in
     }
     free(command);
 
-    stList_sort(alignedPairs, sortByXPlusYCoordinate); //Ensure the coordinates are increasing
-
     //Remove old files
     st_system("rm %s", tempFile1);
     free(tempFile1);
@@ -1070,6 +1065,33 @@ stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, in
         st_system("rm %s", tempFile2);
         free(tempFile2);
     }
+
+    return alignedPairs;
+}
+
+stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p, bool repeatMask) {
+    /*
+     * Uses lastz to compute a bunch of monotonically increasing pairs such that for any pair of consecutive pairs in the list
+     * (x1, y1) (x2, y2) in the set of aligned pairs x1 appears before x2 in X and y1 appears before y2 in Y.
+     */
+    if (lX == 0 || lY == 0) {
+        return stList_construct();
+    }
+
+    if (!repeatMask) {
+        sX = makeUpperCase(sX, lX);
+        sY = makeUpperCase(sY, lY);
+    }
+
+#if defined(_OPENMP)
+    omp_set_lock(&(p->lastzLock));
+    stList *alignedPairs = getBlastPairsP(sX, sY, lX, lY, p, repeatMask);
+    omp_unset_lock(&(p->lastzLock));
+#else
+    stList *alignedPairs = getBlastPairsP(sX, sY, lX, lY, p, repeatMask);
+#endif
+
+    stList_sort(alignedPairs, sortByXPlusYCoordinate); //Ensure the coordinates are increasing
 
     if (!repeatMask) {
         free((char *) sX);
@@ -1148,7 +1170,7 @@ static void getBlastPairsForPairwiseAlignmentParametersP(const char *sX, const c
     if (matrixSize > p->anchorMatrixBiggerThanThis) {
         char *sX2 = stString_getSubString(sX, pX, lX2);
         char *sY2 = stString_getSubString(sY, pY, lY2);
-        stList *unfilteredBottomLevelAnchorPairs = getBlastPairs(sX2, sY2, lX2, lY2, p->constraintDiagonalTrim, p->diagonalExpansion, matrixSize > p->repeatMaskMatrixBiggerThanThis);
+        stList *unfilteredBottomLevelAnchorPairs = getBlastPairs(sX2, sY2, lX2, lY2, p, matrixSize > p->repeatMaskMatrixBiggerThanThis);
         stList_sort(unfilteredBottomLevelAnchorPairs, (int (*)(const void *, const void *)) stIntTuple_cmpFn);
         stList *bottomLevelAnchorPairs = filterToRemoveOverlap(unfilteredBottomLevelAnchorPairs);
         st_logDebug("Got %" PRIi64 " bottom level anchor pairs, which reduced to %" PRIi64 " after filtering \n",
@@ -1169,7 +1191,7 @@ stList *getBlastPairsForPairwiseAlignmentParameters(const char *sX, const char *
         return stList_construct();
     }
     //Anchor pairs
-    stList *unfilteredTopLevelAnchorPairs = getBlastPairs(sX, sY, lX, lY, p->constraintDiagonalTrim, p->diagonalExpansion, 1);
+    stList *unfilteredTopLevelAnchorPairs = getBlastPairs(sX, sY, lX, lY, p, 1);
     stList_sort(unfilteredTopLevelAnchorPairs, (int (*)(const void *, const void *)) stIntTuple_cmpFn);
     stList *topLevelAnchorPairs = filterToRemoveOverlap(unfilteredTopLevelAnchorPairs);
     st_logDebug("Got %" PRIi64 " top level anchor pairs, which reduced to %" PRIi64 " after filtering \n",
@@ -1348,10 +1370,17 @@ PairwiseAlignmentParameters *pairwiseAlignmentBandingParameters_construct() {
     p->alignAmbiguityCharacters = 0;
     p->gapGamma = 0.5;
     p->dynamicAnchorExpansion = 0;
+#if defined(_OPENMP)
+    omp_init_lock(&(p->lastzLock));
+#endif
+
     return p;
 }
 
 void pairwiseAlignmentBandingParameters_destruct(PairwiseAlignmentParameters *p) {
+#if defined(_OPENMP)
+    omp_destroy_lock(&(p->lastzLock));
+#endif
     free(p);
 }
 
