@@ -1008,39 +1008,60 @@ stList *convertPairwiseForwardStrandAlignmentToAnchorPairs(struct PairwiseAlignm
     return alignedPairs;
 }
 
-stList *getBlastPairsP(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p, bool repeatMask) {
+stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p, bool repeatMask) {
     /*
      * Uses lastz to compute a bunch of monotonically increasing pairs such that for any pair of consecutive pairs in the list
      * (x1, y1) (x2, y2) in the set of aligned pairs x1 appears before x2 in X and y1 appears before y2 in Y.
      */
     stList *alignedPairs = stList_construct3(0, (void (*)(void *)) stIntTuple_destruct); //the list to put the output in
 
-    //Write one sequence to file..
+    if (lX == 0 || lY == 0) {
+        return alignedPairs;
+    }
+
+    if (!repeatMask) { // Optionally remove repeat masking
+        sX = makeUpperCase(sX, lX);
+        sY = makeUpperCase(sY, lY);
+    }
+
+
+#if defined(_OPENMP)
+    omp_set_lock(&(p->lastzLock));
+#endif
+    // Get temporary files - notably these functions are not thread safe
     char *tempFile1 = getTempFile();
-    char *tempFile2 = NULL;
+    char *tempFile2 = lY > 1000 ? getTempFile() : NULL;
+#if defined(_OPENMP)
+    omp_unset_lock(&(p->lastzLock));
+#endif
 
+    // Write the sequences to be aligned to the temporary files and construct the lastz command using the temporary files
     writeSequenceToFile(tempFile1, "a", sX);
-
     char *command;
-
     if (lY > 1000) {
-        tempFile2 = getTempFile();
         writeSequenceToFile(tempFile2, "b", sY);
-        command =
-                stString_print(
-                        "cPecanLastz --hspthresh=800 --chain --strand=plus --gapped --format=cigar --ambiguous=iupac,100,100 %s %s",
+        command = stString_print("cPecanLastz --hspthresh=800 --chain --strand=plus --gapped --format=cigar --ambiguous=iupac,100,100 %s %s",
                         tempFile1, tempFile2);
     } else {
-        command =
-                stString_print(
-                        "echo '>b\n%s\n' | cPecanLastz --hspthresh=800 --chain --strand=plus --gapped --format=cigar --ambiguous=iupac,100,100 %s",
+        command = stString_print("echo '>b\n%s\n' | cPecanLastz --hspthresh=800 --chain --strand=plus --gapped --format=cigar --ambiguous=iupac,100,100 %s",
                         sY, tempFile1);
     }
+
+#if defined(_OPENMP)
+    omp_set_lock(&(p->lastzLock));
+#endif
+    // Call lastz with popen
     FILE *fileHandle = popen(command, "r");
+#if defined(_OPENMP)
+    omp_unset_lock(&(p->lastzLock));
+#endif
+
+    // Check popen worked
     if (fileHandle == NULL) {
         st_errnoAbort("Problems with lastz pipe");
     }
-    //Read from stream
+
+    //Read from alignmemnts from the stream
     struct PairwiseAlignment *pA;
     while ((pA = cigarRead(fileHandle)) != NULL) {
         assert(strcmp(pA->contig1, "a") == 0);
@@ -1051,48 +1072,41 @@ stList *getBlastPairsP(const char *sX, const char *sY, int64_t lX, int64_t lY, P
         stList_destruct(alignedPairsForCigar);
         destructPairwiseAlignment(pA);
     }
+
+#if defined(_OPENMP)
+    omp_set_lock(&(p->lastzLock));
+#endif
+    // Close the stream
     int64_t status = pclose(fileHandle);
+#if defined(_OPENMP)
+    omp_unset_lock(&(p->lastzLock));
+#endif
+
+    // Check we closed the process properly
     if (status != 0) {
         st_errnoAbort("pclose failed when getting rid of lastz pipe with value %" PRIi64 " and command %s", status,
                       command);
     }
     free(command);
 
-    //Remove old files
-    st_system("rm %s", tempFile1);
+    //Remove temporary files
+    status = remove(tempFile1);
+    if (status != 0) {
+        st_errnoAbort("Failed to remove first temporary file when running lastz");
+    }
     free(tempFile1);
     if (tempFile2 != NULL) {
-        st_system("rm %s", tempFile2);
-        free(tempFile2);
+        status = remove(tempFile2);
+        if (status != 0) {
+            st_errnoAbort("Failed to remove second temporary file when running lastz");
+        }
     }
+    free(tempFile2);
 
-    return alignedPairs;
-}
+    //Ensure the coordinates are increasing
+    stList_sort(alignedPairs, sortByXPlusYCoordinate);
 
-stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p, bool repeatMask) {
-    /*
-     * Uses lastz to compute a bunch of monotonically increasing pairs such that for any pair of consecutive pairs in the list
-     * (x1, y1) (x2, y2) in the set of aligned pairs x1 appears before x2 in X and y1 appears before y2 in Y.
-     */
-    if (lX == 0 || lY == 0) {
-        return stList_construct();
-    }
-
-    if (!repeatMask) {
-        sX = makeUpperCase(sX, lX);
-        sY = makeUpperCase(sY, lY);
-    }
-
-#if defined(_OPENMP)
-    omp_set_lock(&(p->lastzLock));
-    stList *alignedPairs = getBlastPairsP(sX, sY, lX, lY, p, repeatMask);
-    omp_unset_lock(&(p->lastzLock));
-#else
-    stList *alignedPairs = getBlastPairsP(sX, sY, lX, lY, p, repeatMask);
-#endif
-
-    stList_sort(alignedPairs, sortByXPlusYCoordinate); //Ensure the coordinates are increasing
-
+    // If we removed the repeat masking, clean up the temporary sequences
     if (!repeatMask) {
         free((char *) sX);
         free((char *) sY);
