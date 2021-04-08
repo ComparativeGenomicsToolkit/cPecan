@@ -16,7 +16,6 @@
 #include "sonLib.h"
 #include "pairwiseAligner.h"
 #include "pairwiseAlignment.h"
-#include "../../sonLib/lib/multipleAligner.h"
 
 // OpenMP
 #if defined(_OPENMP)
