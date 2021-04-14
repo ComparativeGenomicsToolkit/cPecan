@@ -1023,15 +1023,9 @@ stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, Pa
         sY = makeUpperCase(sY, lY);
     }
 
-#if defined(_OPENMP)
-    omp_set_lock(&(p->lastzLock2));
-#endif
-    // Get temporary files - notably these functions are not thread safe
+    // Get temporary files - notably these functions are hopefully thread safe now
     char *tempFile1 = getTempFile();
     char *tempFile2 = lY > 1000 ? getTempFile() : NULL;
-#if defined(_OPENMP)
-    omp_unset_lock(&(p->lastzLock2));
-#endif
 
     // Write the sequences to be aligned to the temporary files and construct the lastz command using the temporary files
     writeSequenceToFile(tempFile1, "a", sX);
@@ -1382,11 +1376,8 @@ PairwiseAlignmentParameters *pairwiseAlignmentBandingParameters_construct() {
     p->alignAmbiguityCharacters = 0;
     p->gapGamma = 0.5;
     p->dynamicAnchorExpansion = 0;
-#if defined(_OPENMP)
-#if defined(PECAN_LOCK_POPEN)
+#if defined(_OPENMP) && defined(PECAN_LOCK_POPEN)
     omp_init_lock(&(p->lastzLock));
-#endif
-    omp_init_lock(&(p->lastzLock2));
 #endif
 
     return p;
