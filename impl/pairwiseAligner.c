@@ -1045,12 +1045,12 @@ stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, Pa
                                  sY, tempFile1);
     }
 
-#if defined(_OPENMP)
+#if defined(_OPENMP) && defined(PECAN_LOCK_POPEN)
     omp_set_lock(&(p->lastzLock));
 #endif
     // Call lastz with popen
     FILE *fileHandle = popen(command, "r");
-#if defined(_OPENMP)
+#if defined(_OPENMP) && defined(PECAN_LOCK_POPEN)
     omp_unset_lock(&(p->lastzLock));
 #endif
 
@@ -1071,12 +1071,12 @@ stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, Pa
         destructPairwiseAlignment(pA);
     }
 
-#if defined(_OPENMP)
+#if defined(_OPENMP) && defined(PECAN_LOCK_POPEN)
     omp_set_lock(&(p->lastzLock));
 #endif
     // Close the stream
     int64_t status = pclose(fileHandle);
-#if defined(_OPENMP)
+#if defined(_OPENMP) && defined(PECAN_LOCK_POPEN)
     omp_unset_lock(&(p->lastzLock));
 #endif
 
@@ -1383,7 +1383,9 @@ PairwiseAlignmentParameters *pairwiseAlignmentBandingParameters_construct() {
     p->gapGamma = 0.5;
     p->dynamicAnchorExpansion = 0;
 #if defined(_OPENMP)
+#if defined(PECAN_LOCK_POPEN)
     omp_init_lock(&(p->lastzLock));
+#endif
     omp_init_lock(&(p->lastzLock2));
 #endif
 
