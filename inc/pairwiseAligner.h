@@ -45,6 +45,7 @@ typedef struct _pairwiseAlignmentBandingParameters {
     // single expansion
 #if defined(_OPENMP)
     omp_lock_t lastzLock; // This lock used to gate access to calling out to lastz
+    omp_lock_t lastzLock2; // This lock used to gate access to temp files used to communicate with lastz
 #endif
 } PairwiseAlignmentParameters;
 
