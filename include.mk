@@ -6,16 +6,15 @@ BINDIR ?= ${sonLibRootDir}/bin
 LIBDIR ?= ${sonLibDir}
 CPPFLAGS +=-I${sonLibRootDir}/C/inc -I${sonLibRootDir}/externalTools/cutest/
 
-# Hack to include openmp
-CFLAGS+= -fopenmp
-
 ifndef TARGETOS
   TARGETOS := $(shell uname -s)
 endif
 
 # Hack to include openmp on os x after "brew install lomp
 ifeq ($(TARGETOS), Darwin)
-	CFLAGS+= -Xpreprocessor -lomp
+	CFLAGS+= -Xpreprocessor -fopenmp -lomp
+else
+	CFLAGS+= -fopenmp
 endif
 
 include  ${sonLibRootDir}/include.mk
