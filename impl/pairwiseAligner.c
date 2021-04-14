@@ -1384,7 +1384,7 @@ PairwiseAlignmentParameters *pairwiseAlignmentBandingParameters_construct() {
 }
 
 void pairwiseAlignmentBandingParameters_destruct(PairwiseAlignmentParameters *p) {
-#if defined(_OPENMP)
+#if defined(_OPENMP) && defined(PECAN_LOCK_POPEN)
     omp_destroy_lock(&(p->lastzLock));
 #endif
     free(p);
