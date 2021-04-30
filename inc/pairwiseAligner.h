@@ -258,6 +258,12 @@ void getPosteriorProbsWithBanding(StateMachine *sM, stList *anchorPairs, const S
 
 //Blast pairs
 
+int cmpKmers(const char *k1, const char *k2, int64_t k, int64_t *matchLength);
+
+stList *getSharedKmers(const char *sX, const char *sY, int64_t lX, int64_t lY, int64_t minMatchLength, int64_t k, int64_t maxSharedOccurrences);
+
+stList *getSharedAlignedKmers(const char *sX, const char *sY, int64_t lX, int64_t lY, int64_t minMatchLength, int64_t k, int64_t maxSharedOccurrences);
+
 stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p, bool repeatMask);
 
 stList *getBlastPairsForPairwiseAlignmentParameters(const char *sX, const char *sY, const int64_t lX, const int64_t lY,

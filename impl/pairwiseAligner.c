@@ -4,6 +4,8 @@
  *  Created on: 1 Mar 2012
  *      Author: benedictpaten
  */
+#include "safesort.h"
+
 //This is being included to make popen work!
 #define _XOPEN_SOURCE 500
 
@@ -1007,12 +1009,208 @@ stList *convertPairwiseForwardStrandAlignmentToAnchorPairs(struct PairwiseAlignm
     return alignedPairs;
 }
 
+/* must warp function pointer in data, as ISO C doesn't allow conversions
+ * between void* and function pointers */
+struct sortKmersArgs {
+    const char *sequence;
+    int64_t k;
+};
+
+int cmpKmers(const char *k1, const char *k2, int64_t k, int64_t *matchLength) {
+    for(int64_t i=0; i<k; i++) {
+        if(tolower(k1[i]) < tolower(k2[i])) {
+            *matchLength = i;
+            return -1;
+        }
+        if(tolower(k1[i]) > tolower(k2[i])) {
+            *matchLength = i;
+            return 1;
+        }
+    }
+    *matchLength = k;
+    return 0;
+}
+
+/* converts pointer to pointer into pointer to element */
+static int sortKmersCmpFn(const void *a, const void *b, void* args) {
+    struct sortKmersArgs *sargs = (struct sortKmersArgs *)args;
+    int64_t m; // dummy variable used to store match length
+    return cmpKmers(&(sargs->sequence[*(int64_t *)a]), &(sargs->sequence[*(int64_t *)b]), sargs->k, &m);
+}
+
+int64_t *getSortedKmers(const char *sequence, const int64_t length, const int64_t k) {
+    int64_t *sortedKmers = st_malloc(sizeof(int64_t) * (length - k + 1));
+
+    // Initialize the sortedKmers array with the start indices of the kmers in the sequence
+    for(int64_t i=0; i<length-k+1; i++) {
+        sortedKmers[i] = i;
+    }
+
+    // Now sort the kmers by kmer content
+    struct sortKmersArgs args = {sequence, k};
+    safesort(sortedKmers, length-k+1, sizeof(int64_t), sortKmersCmpFn, &args);
+
+    return sortedKmers;
+}
+
+int64_t getRunLength(const char *sequence, int64_t *sortedKmers, int64_t length, int64_t k, int64_t i) {
+    int64_t j=1, matchLength;
+    while(i+j < length && cmpKmers(&sequence[sortedKmers[i]], &sequence[sortedKmers[i+j]], k, &matchLength) == 0) {
+        assert(matchLength == k);
+        j++;
+    }
+    return j;
+}
+
+void addToSharedKmerPairs(stList *sharedKmerPairs, int64_t x, int64_t y, int64_t matchLength) {
+    int64_t j=1;
+    for(int64_t i=j; i<matchLength-j; i++) {
+        stList_append(sharedKmerPairs, stIntTuple_construct3(1, x+i, y+i));
+    }
+}
+
+/*
+ * Gets the index that the suffix would be inserted at in the list, shifting elements at that index and subsequently
+ * up.
+ */
+int64_t binarySearch(int64_t *sortedTargetSuffixes, int64_t targetLength, const char *targetSequence, const char *searchSequence, int64_t k, int64_t *matchLength) {
+    int64_t l=0, h=targetLength, i; // interval (l, h) that item can be in, l is inclusive, h is exclusive
+    while(l < h) {
+        int64_t m = (l + h) / 2; // Mid point
+        i = cmpKmers(searchSequence, &targetSequence[sortedTargetSuffixes[m]], k, matchLength);
+        if(i < 0) { // Item must occur before m in the list
+            h = m;
+        }
+        else if(i > 0) { // Item must occur after m in the list
+            l = m+1;
+        } else { // else item at index i equals i
+            return m;
+        }
+    }
+    assert(l == h);
+    assert(i != 0);
+
+    // Determine the length of the longest match
+    if(i < 0) { // Case we matched against suffix at m
+        if(l-1 >= 0) {
+            int64_t matchLength2;
+            i = cmpKmers(searchSequence, &targetSequence[sortedTargetSuffixes[l - 1]], k, &matchLength2);
+            if(*matchLength == matchLength2) {
+                return -1;
+            }
+            if(*matchLength > matchLength2) {
+                return l;
+            }
+            *matchLength = matchLength2;
+            return l-1;
+        }
+    }
+    else {
+        if (l+1 < targetLength) {
+            int64_t matchLength2;
+            i = cmpKmers(searchSequence, &targetSequence[sortedTargetSuffixes[l + 1]], k, &matchLength2);
+            if (*matchLength == matchLength2) {
+                return -1;
+            }
+            if (*matchLength > matchLength2) {
+                return l;
+            }
+            *matchLength = matchLength2;
+            return l + 1;
+        }
+    }
+    return l; // case we're at the beginning or end
+}
+
+stList *getSharedKmers(const char *sX, const char *sY, int64_t lX, int64_t lY, int64_t minMatchLength, int64_t k, int64_t maxSharedOccurrences) {
+    stList *sharedKmerPairs = stList_construct3(0, (void (*)(void *))stIntTuple_destruct);
+
+    // Get the kmers in each sequence sorted lexicographically
+    //int64_t *sortedKmersX = getSortedKmers(sX, lX, k);
+    int64_t *sortedKmersY = getSortedKmers(sY, lY, k);
+
+    for(int64_t i=0; i<lX-k+1; i++) {
+        int64_t matchLength;
+        int64_t j = binarySearch(sortedKmersY, lY-k+1, sY, &sX[i], k, &matchLength);
+        //st_uglyf("hello %i %i\n", (int)matchLength, (int)j);
+        if(j >= 0 && j < lY-k+1 && matchLength >= minMatchLength) {
+            addToSharedKmerPairs(sharedKmerPairs, i, sortedKmersY[j], matchLength);
+        }
+    }
+
+    /*int64_t i=0, j=0, m, n, matchLength;
+    while(i<lX-k+1 && j<lY-k+1) {
+        switch(cmpKmers(&sX[sortedKmersX[i]], &sY[sortedKmersY[j]], k, &matchLength)) {
+            case -1: // Case kmer in sX is less than all the remaining kmers in sY
+                // so shift to next kmer
+                if(matchLength >= minMatchLength) {
+                    addToSharedKmerPairs(sharedKmerPairs, sortedKmersX[i], sortedKmersY[j], matchLength);
+                }
+                i++;
+                break;
+            case 1: // Case kmer in sY is less than all the remaining kmers in sX
+                // so shift to next kmer
+                if(matchLength >= minMatchLength) {
+                    addToSharedKmerPairs(sharedKmerPairs, sortedKmersX[i], sortedKmersY[j], matchLength);
+                }
+                j++;
+                break;
+            case 0:
+                // Got a match, need to calculate all the matching pairs
+                assert(matchLength == k);
+                m=getRunLength(sX, sortedKmersX, lX-k+1, k, i);
+                n=getRunLength(sY, sortedKmersY, lY-k+1, k, j);
+                if(m * n <= maxSharedOccurrences) {
+                    for (int64_t p = 0; p < m; p++) {
+                        for (int64_t q = 0; q < n; q++) {
+                            addToSharedKmerPairs(sharedKmerPairs, sortedKmersX[p + i], sortedKmersY[q + j], matchLength);
+                        }
+                    }
+                }
+                i+=m; j+=n;
+                break;
+            default:
+                assert(0);
+        }
+    }*/
+
+    // cleanup
+    //free(sortedKmersX);
+    free(sortedKmersY);
+
+    return sharedKmerPairs;
+}
+
+stList *getSharedAlignedKmers(const char *sX, const char *sY, int64_t lX, int64_t lY, int64_t minMatchLength, int64_t k, int64_t maxSharedOccurrences) {
+    stList *sharedKmerPairs = getSharedKmers(sX, sY, lX, lY, minMatchLength, k, maxSharedOccurrences);
+    double alignmentScore;
+    PairwiseAlignmentParameters *p = pairwiseAlignmentBandingParameters_construct();
+
+    stList_sort(sharedKmerPairs, (int (*)(const void *, const void *)) sortByXPlusYCoordinate); //stIntTuple_cmpFn);
+
+    fprintf(stderr, "hello2 %i\n", (int)stList_length(sharedKmerPairs));
+    stList *alignedKmerPairs = getMaximalExpectedAccuracyPairwiseAlignment(sharedKmerPairs, stList_construct(), stList_construct(), lX, lY, &alignmentScore, p);
+
+    return alignedKmerPairs;
+}
+
 stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p, bool repeatMask) {
     /*
      * Uses lastz to compute a bunch of monotonically increasing pairs such that for any pair of consecutive pairs in the list
      * (x1, y1) (x2, y2) in the set of aligned pairs x1 appears before x2 in X and y1 appears before y2 in Y.
      */
     stList *alignedPairs = stList_construct3(0, (void (*)(void *)) stIntTuple_destruct); //the list to put the output in
+
+    /*stList *alignedKmerPairs = getSharedAlignedKmers(sX, sY, lX, lY, 10, 20, 1);
+
+    fprintf(stderr, "hello %i\n", (int)stList_length(alignedKmerPairs));
+
+    for(int64_t i=0; i<stList_length(alignedKmerPairs); i++) {
+        stIntTuple *aPair = stList_get(alignedKmerPairs, i);
+        stList_append(alignedPairs, stIntTuple_construct3(stIntTuple_get(aPair, 1), stIntTuple_get(aPair, 2), p->diagonalExpansion));
+    }
+
+    return alignedPairs;*/
 
     if (lX == 0 || lY == 0) {
         return alignedPairs;
