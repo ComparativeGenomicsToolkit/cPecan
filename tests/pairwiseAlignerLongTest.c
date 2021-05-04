@@ -87,23 +87,21 @@ void compareToTrueAlignment(CuTest *testCase, stSortedSet *pairs, char *align1, 
     stSortedSet_destruct(pairs2);
 }
 
-
-//static int64_t calcNumberOfSharedKmers()
-
-static void test_pairwiseAlignerKmerAnchors(CuTest *testCase, char *seq1, char *seq2, char *align1, char *align2, char *seqName1, char *seqName2, int64_t minMatchLength, int64_t k, int64_t maxSharedOccurrences) {
-    stList *sharedKmers = getSharedKmers(seq1, seq2, strlen(seq1), strlen(seq2), minMatchLength, k, maxSharedOccurrences);
-    st_logInfo("I have %i shared, unaligned kmers (k=%i) between the %s and %s sequences of lengths %i %i\n", (int)stList_length(sharedKmers), (int)k, seqName1, seqName2, (int)strlen(seq1), (int)strlen(seq2));
-
-    stList *sharedAlignedKmers = getSharedAlignedKmers(seq1, seq2, strlen(seq1), strlen(seq2), minMatchLength, k, maxSharedOccurrences);
-    st_logInfo("I have %i shared, aligned kmers (k=%i) between the %s and %s sequences of lengths %i %i\n", (int)stList_length(sharedAlignedKmers), (int)k, seqName1, seqName2, (int)strlen(seq1), (int)strlen(seq2));
+static void test_pairwiseAlignerMumAnchors(CuTest *testCase, char *seq1, char *seq2, char *align1, char *align2,
+                                            char *seqName1, char *seqName2) {
+    PairwiseAlignmentParameters *p = pairwiseAlignmentBandingParameters_construct();
+    time_t startTime = time(NULL);
+    stList *alignedMums = getAlignedMums(seq1, seq2, strlen(seq1), strlen(seq2), p, 0, 0);
+    st_logInfo("I have %i shared, aligned mums (k=%i) between the %s and %s sequences of lengths %i %i in %f seconds\n", (int)stList_length(alignedMums), (int)p->k, seqName1, seqName2, (int)strlen(seq1), (int)strlen(seq2), (double)(time(NULL) - startTime));
 
     stSortedSet *pairs = stSortedSet_construct3((int(*)(const void *, const void *)) stIntTuple_cmpFn,
     (void(*)(void *)) stIntTuple_destruct);
 
-    for(int64_t i=0; i<stList_length(sharedAlignedKmers); i++) {
-        stIntTuple *kmer = stList_get(sharedAlignedKmers, i);
-        st_logDebug("-->Got match (length=%i) at %i %i\n", (int)stIntTuple_get(kmer, 0), (int)stIntTuple_get(kmer, 1), (int)stIntTuple_get(kmer, 2));
-        stIntTuple *k = stIntTuple_construct2(stIntTuple_get(kmer, 1), stIntTuple_get(kmer, 2));
+    for(int64_t i=0; i<stList_length(alignedMums); i++) {
+        stIntTuple *mum = stList_get(alignedMums, i);
+        st_logDebug("-->Got match at %i %i\n", (int)stIntTuple_get(mum, 0),
+                    (int)stIntTuple_get(mum, 1));
+        stIntTuple *k = stIntTuple_construct2(stIntTuple_get(mum, 0), stIntTuple_get(mum, 1));
         CuAssertTrue(testCase,stSortedSet_search(pairs, k) == NULL);
         stSortedSet_insert(pairs, k);
     }
@@ -111,12 +109,7 @@ static void test_pairwiseAlignerKmerAnchors(CuTest *testCase, char *seq1, char *
     compareToTrueAlignment(testCase, pairs, align1, align2, seqName1, seqName2);
 
     stSortedSet_destruct(pairs);
-    stList_destruct(sharedKmers);
-
-}
-
-static void test_pairwiseAlignerKmerAnchorsSmallExample(CuTest *testCase) {
-    //test_pairwiseAlignerKmerAnchors(testCase, "GATTACA", "GATTTACA", "little1", "little2", 2, 1000000);
+    stList_destruct(alignedMums);
 }
 
 static void test_pairwiseAligner(CuTest *testCase, char *seq1, char *seq2, char *align1, char *align2, char *seqName1, char *seqName2) {
@@ -168,25 +161,22 @@ static void test_pairwiseAligner(CuTest *testCase, char *seq1, char *seq2, char 
 }
 
 static void test_pairwiseAligner_LongHumanChimp(CuTest *testCase) {
-    //return;
-    //test_pairwiseAlignerKmerAnchors(testCase, humanSeq, chimpSeq, humanAlign, chimpAlign, "human", "chimp", 10, 20, 1);
-    //test_pairwiseAligner(testCase, humanSeq, chimpSeq, humanAlign, chimpAlign, "human", "chimp");
+    test_pairwiseAlignerMumAnchors(testCase, humanSeq, chimpSeq, humanAlign, chimpAlign, "human", "chimp");
+    test_pairwiseAligner(testCase, humanSeq, chimpSeq, humanAlign, chimpAlign, "human", "chimp");
 }
 
 static void test_pairwiseAligner_LongHumanMouse(CuTest *testCase) {
-    test_pairwiseAlignerKmerAnchors(testCase, humanSeq, mouseSeq, humanAlign, mouseAlign, "human", "mouse", 3, 100, 1);
-    //test_pairwiseAligner(testCase, humanSeq, mouseSeq, humanAlign, mouseAlign, "human", "mouse");
+    test_pairwiseAlignerMumAnchors(testCase, humanSeq, mouseSeq, humanAlign, mouseAlign, "human", "mouse");
+    test_pairwiseAligner(testCase, humanSeq, mouseSeq, humanAlign, mouseAlign, "human", "mouse");
 }
 
 static void test_pairwiseAligner_LongHumanDog(CuTest *testCase) {
-    //return;
-    //test_pairwiseAlignerKmerAnchors(testCase, humanSeq, dogSeq, humanAlign, dogAlign, "human", "dog", 10, 100, 1);
-    //test_pairwiseAligner(testCase, humanSeq, dogSeq, humanAlign, dogAlign, "human", "dog");
+    test_pairwiseAlignerMumAnchors(testCase, humanSeq, dogSeq, humanAlign, dogAlign, "human", "dog");
+    test_pairwiseAligner(testCase, humanSeq, dogSeq, humanAlign, dogAlign, "human", "dog");
 }
 
 CuSuite* pairwiseAlignmentLongTestSuite(void) {
     CuSuite* suite = CuSuiteNew();
-    SUITE_ADD_TEST(suite, test_pairwiseAlignerKmerAnchorsSmallExample);
     SUITE_ADD_TEST(suite, test_pairwiseAligner_LongHumanDog);
     SUITE_ADD_TEST(suite, test_pairwiseAligner_LongHumanChimp);
     SUITE_ADD_TEST(suite, test_pairwiseAligner_LongHumanMouse);

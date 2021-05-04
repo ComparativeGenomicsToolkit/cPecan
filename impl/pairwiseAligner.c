@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <ctype.h>
+#include <time.h>
 
 #include "bioioC.h"
 #include "sonLib.h"
@@ -963,12 +964,6 @@ double computeForwardProbability(char *seqX, char *seqY, stList *anchorPairs, Pa
 ///////////////////////////////////
 ///////////////////////////////////
 
-static int sortByXPlusYCoordinate(const void *i, const void *j) {
-    int64_t k = stIntTuple_get((stIntTuple *) i, 0) + stIntTuple_get((stIntTuple *) i, 1);
-    int64_t l = stIntTuple_get((stIntTuple *) j, 0) + stIntTuple_get((stIntTuple *) j, 1);
-    return k > l ? 1 : (k < l ? -1 : 0);
-}
-
 static char *makeUpperCase(const char *s, int64_t l) {
     char *s2 = stString_copy(s);
     for (int64_t i = 0; i < l; i++) {
@@ -1009,208 +1004,12 @@ stList *convertPairwiseForwardStrandAlignmentToAnchorPairs(struct PairwiseAlignm
     return alignedPairs;
 }
 
-/* must warp function pointer in data, as ISO C doesn't allow conversions
- * between void* and function pointers */
-struct sortKmersArgs {
-    const char *sequence;
-    int64_t k;
-};
-
-int cmpKmers(const char *k1, const char *k2, int64_t k, int64_t *matchLength) {
-    for(int64_t i=0; i<k; i++) {
-        if(tolower(k1[i]) < tolower(k2[i])) {
-            *matchLength = i;
-            return -1;
-        }
-        if(tolower(k1[i]) > tolower(k2[i])) {
-            *matchLength = i;
-            return 1;
-        }
-    }
-    *matchLength = k;
-    return 0;
-}
-
-/* converts pointer to pointer into pointer to element */
-static int sortKmersCmpFn(const void *a, const void *b, void* args) {
-    struct sortKmersArgs *sargs = (struct sortKmersArgs *)args;
-    int64_t m; // dummy variable used to store match length
-    return cmpKmers(&(sargs->sequence[*(int64_t *)a]), &(sargs->sequence[*(int64_t *)b]), sargs->k, &m);
-}
-
-int64_t *getSortedKmers(const char *sequence, const int64_t length, const int64_t k) {
-    int64_t *sortedKmers = st_malloc(sizeof(int64_t) * (length - k + 1));
-
-    // Initialize the sortedKmers array with the start indices of the kmers in the sequence
-    for(int64_t i=0; i<length-k+1; i++) {
-        sortedKmers[i] = i;
-    }
-
-    // Now sort the kmers by kmer content
-    struct sortKmersArgs args = {sequence, k};
-    safesort(sortedKmers, length-k+1, sizeof(int64_t), sortKmersCmpFn, &args);
-
-    return sortedKmers;
-}
-
-int64_t getRunLength(const char *sequence, int64_t *sortedKmers, int64_t length, int64_t k, int64_t i) {
-    int64_t j=1, matchLength;
-    while(i+j < length && cmpKmers(&sequence[sortedKmers[i]], &sequence[sortedKmers[i+j]], k, &matchLength) == 0) {
-        assert(matchLength == k);
-        j++;
-    }
-    return j;
-}
-
-void addToSharedKmerPairs(stList *sharedKmerPairs, int64_t x, int64_t y, int64_t matchLength) {
-    int64_t j=1;
-    for(int64_t i=j; i<matchLength-j; i++) {
-        stList_append(sharedKmerPairs, stIntTuple_construct3(1, x+i, y+i));
-    }
-}
-
-/*
- * Gets the index that the suffix would be inserted at in the list, shifting elements at that index and subsequently
- * up.
- */
-int64_t binarySearch(int64_t *sortedTargetSuffixes, int64_t targetLength, const char *targetSequence, const char *searchSequence, int64_t k, int64_t *matchLength) {
-    int64_t l=0, h=targetLength, i; // interval (l, h) that item can be in, l is inclusive, h is exclusive
-    while(l < h) {
-        int64_t m = (l + h) / 2; // Mid point
-        i = cmpKmers(searchSequence, &targetSequence[sortedTargetSuffixes[m]], k, matchLength);
-        if(i < 0) { // Item must occur before m in the list
-            h = m;
-        }
-        else if(i > 0) { // Item must occur after m in the list
-            l = m+1;
-        } else { // else item at index i equals i
-            return m;
-        }
-    }
-    assert(l == h);
-    assert(i != 0);
-
-    // Determine the length of the longest match
-    if(i < 0) { // Case we matched against suffix at m
-        if(l-1 >= 0) {
-            int64_t matchLength2;
-            i = cmpKmers(searchSequence, &targetSequence[sortedTargetSuffixes[l - 1]], k, &matchLength2);
-            if(*matchLength == matchLength2) {
-                return -1;
-            }
-            if(*matchLength > matchLength2) {
-                return l;
-            }
-            *matchLength = matchLength2;
-            return l-1;
-        }
-    }
-    else {
-        if (l+1 < targetLength) {
-            int64_t matchLength2;
-            i = cmpKmers(searchSequence, &targetSequence[sortedTargetSuffixes[l + 1]], k, &matchLength2);
-            if (*matchLength == matchLength2) {
-                return -1;
-            }
-            if (*matchLength > matchLength2) {
-                return l;
-            }
-            *matchLength = matchLength2;
-            return l + 1;
-        }
-    }
-    return l; // case we're at the beginning or end
-}
-
-stList *getSharedKmers(const char *sX, const char *sY, int64_t lX, int64_t lY, int64_t minMatchLength, int64_t k, int64_t maxSharedOccurrences) {
-    stList *sharedKmerPairs = stList_construct3(0, (void (*)(void *))stIntTuple_destruct);
-
-    // Get the kmers in each sequence sorted lexicographically
-    //int64_t *sortedKmersX = getSortedKmers(sX, lX, k);
-    int64_t *sortedKmersY = getSortedKmers(sY, lY, k);
-
-    for(int64_t i=0; i<lX-k+1; i++) {
-        int64_t matchLength;
-        int64_t j = binarySearch(sortedKmersY, lY-k+1, sY, &sX[i], k, &matchLength);
-        //st_uglyf("hello %i %i\n", (int)matchLength, (int)j);
-        if(j >= 0 && j < lY-k+1 && matchLength >= minMatchLength) {
-            addToSharedKmerPairs(sharedKmerPairs, i, sortedKmersY[j], matchLength);
-        }
-    }
-
-    /*int64_t i=0, j=0, m, n, matchLength;
-    while(i<lX-k+1 && j<lY-k+1) {
-        switch(cmpKmers(&sX[sortedKmersX[i]], &sY[sortedKmersY[j]], k, &matchLength)) {
-            case -1: // Case kmer in sX is less than all the remaining kmers in sY
-                // so shift to next kmer
-                if(matchLength >= minMatchLength) {
-                    addToSharedKmerPairs(sharedKmerPairs, sortedKmersX[i], sortedKmersY[j], matchLength);
-                }
-                i++;
-                break;
-            case 1: // Case kmer in sY is less than all the remaining kmers in sX
-                // so shift to next kmer
-                if(matchLength >= minMatchLength) {
-                    addToSharedKmerPairs(sharedKmerPairs, sortedKmersX[i], sortedKmersY[j], matchLength);
-                }
-                j++;
-                break;
-            case 0:
-                // Got a match, need to calculate all the matching pairs
-                assert(matchLength == k);
-                m=getRunLength(sX, sortedKmersX, lX-k+1, k, i);
-                n=getRunLength(sY, sortedKmersY, lY-k+1, k, j);
-                if(m * n <= maxSharedOccurrences) {
-                    for (int64_t p = 0; p < m; p++) {
-                        for (int64_t q = 0; q < n; q++) {
-                            addToSharedKmerPairs(sharedKmerPairs, sortedKmersX[p + i], sortedKmersY[q + j], matchLength);
-                        }
-                    }
-                }
-                i+=m; j+=n;
-                break;
-            default:
-                assert(0);
-        }
-    }*/
-
-    // cleanup
-    //free(sortedKmersX);
-    free(sortedKmersY);
-
-    return sharedKmerPairs;
-}
-
-stList *getSharedAlignedKmers(const char *sX, const char *sY, int64_t lX, int64_t lY, int64_t minMatchLength, int64_t k, int64_t maxSharedOccurrences) {
-    stList *sharedKmerPairs = getSharedKmers(sX, sY, lX, lY, minMatchLength, k, maxSharedOccurrences);
-    double alignmentScore;
-    PairwiseAlignmentParameters *p = pairwiseAlignmentBandingParameters_construct();
-
-    stList_sort(sharedKmerPairs, (int (*)(const void *, const void *)) sortByXPlusYCoordinate); //stIntTuple_cmpFn);
-
-    fprintf(stderr, "hello2 %i\n", (int)stList_length(sharedKmerPairs));
-    stList *alignedKmerPairs = getMaximalExpectedAccuracyPairwiseAlignment(sharedKmerPairs, stList_construct(), stList_construct(), lX, lY, &alignmentScore, p);
-
-    return alignedKmerPairs;
-}
-
 stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p, bool repeatMask) {
     /*
      * Uses lastz to compute a bunch of monotonically increasing pairs such that for any pair of consecutive pairs in the list
      * (x1, y1) (x2, y2) in the set of aligned pairs x1 appears before x2 in X and y1 appears before y2 in Y.
      */
     stList *alignedPairs = stList_construct3(0, (void (*)(void *)) stIntTuple_destruct); //the list to put the output in
-
-    /*stList *alignedKmerPairs = getSharedAlignedKmers(sX, sY, lX, lY, 10, 20, 1);
-
-    fprintf(stderr, "hello %i\n", (int)stList_length(alignedKmerPairs));
-
-    for(int64_t i=0; i<stList_length(alignedKmerPairs); i++) {
-        stIntTuple *aPair = stList_get(alignedKmerPairs, i);
-        stList_append(alignedPairs, stIntTuple_construct3(stIntTuple_get(aPair, 1), stIntTuple_get(aPair, 2), p->diagonalExpansion));
-    }
-
-    return alignedPairs;*/
 
     if (lX == 0 || lY == 0) {
         return alignedPairs;
@@ -1294,7 +1093,7 @@ stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, Pa
     free(tempFile2);
 
     //Ensure the coordinates are increasing
-    stList_sort(alignedPairs, sortByXPlusYCoordinate);
+    //stList_sort(alignedPairs, sortByXPlusYCoordinate);
 
     // If we removed the repeat masking, clean up the temporary sequences
     if (!repeatMask) {
@@ -1302,7 +1101,11 @@ stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, Pa
         free((char *) sY);
     }
 
-    return alignedPairs;
+    // Convert to an alignment
+    stList_sort(alignedPairs, (int (*)(const void *, const void *)) stIntTuple_cmpFn);
+    stList *filteredAnchorPairs = filterToRemoveOverlap(alignedPairs);
+    stList_destruct(alignedPairs);
+    return filteredAnchorPairs;
 }
 
 static void convertBlastPairs(stList *alignedPairs2, int64_t offsetX, int64_t offsetY) {
@@ -1374,12 +1177,8 @@ static void getBlastPairsForPairwiseAlignmentParametersP(const char *sX, const c
     if (matrixSize > p->anchorMatrixBiggerThanThis) {
         char *sX2 = stString_getSubString(sX, pX, lX2);
         char *sY2 = stString_getSubString(sY, pY, lY2);
-        stList *unfilteredBottomLevelAnchorPairs = getBlastPairs(sX2, sY2, lX2, lY2, p, matrixSize > p->repeatMaskMatrixBiggerThanThis);
-        stList_sort(unfilteredBottomLevelAnchorPairs, (int (*)(const void *, const void *)) stIntTuple_cmpFn);
-        stList *bottomLevelAnchorPairs = filterToRemoveOverlap(unfilteredBottomLevelAnchorPairs);
-        st_logDebug("Got %" PRIi64 " bottom level anchor pairs, which reduced to %" PRIi64 " after filtering \n",
-                stList_length(unfilteredBottomLevelAnchorPairs), stList_length(bottomLevelAnchorPairs));
-        stList_destruct(unfilteredBottomLevelAnchorPairs);
+        stList *bottomLevelAnchorPairs = getBlastPairs(sX2, sY2, lX2, lY2, p, matrixSize > p->repeatMaskMatrixBiggerThanThis);
+        st_logDebug("Got %" PRIi64 " bottom level anchor pairs\n", stList_length(bottomLevelAnchorPairs));
         convertBlastPairs(bottomLevelAnchorPairs, pX, pY);
         free(sX2);
         free(sY2);
@@ -1395,12 +1194,8 @@ stList *getBlastPairsForPairwiseAlignmentParameters(const char *sX, const char *
         return stList_construct();
     }
     //Anchor pairs
-    stList *unfilteredTopLevelAnchorPairs = getBlastPairs(sX, sY, lX, lY, p, 1);
-    stList_sort(unfilteredTopLevelAnchorPairs, (int (*)(const void *, const void *)) stIntTuple_cmpFn);
-    stList *topLevelAnchorPairs = filterToRemoveOverlap(unfilteredTopLevelAnchorPairs);
-    st_logDebug("Got %" PRIi64 " top level anchor pairs, which reduced to %" PRIi64 " after filtering \n",
-            stList_length(unfilteredTopLevelAnchorPairs), stList_length(topLevelAnchorPairs));
-    stList_destruct(unfilteredTopLevelAnchorPairs);
+    stList *topLevelAnchorPairs = getBlastPairs(sX, sY, lX, lY, p, 1);
+    st_logDebug("Got %" PRIi64 " top level anchor pairs \n", stList_length(topLevelAnchorPairs));
 
     int64_t pX = 0;
     int64_t pY = 0;
@@ -1423,6 +1218,14 @@ stList *getBlastPairsForPairwiseAlignmentParameters(const char *sX, const char *
     stList_destruct(topLevelAnchorPairs);
     st_logDebug("Got %" PRIi64 " combined anchor pairs\n", stList_length(combinedAnchorPairs));
     return combinedAnchorPairs;
+}
+
+stList *getAnchorPairsForPairwiseAlignmentParameters(const char *sX, const char *sY, const int64_t lX, const int64_t lY,
+                                                    PairwiseAlignmentParameters *p) {
+    if(p->useMumAnchors) {
+        return getAlignedMums(sX, sY, lX, lY, p, 0, 0);
+    }
+    return getBlastPairsForPairwiseAlignmentParameters(sX, sY, lX, lY, p);
 }
 
 ///////////////////////////////////
@@ -1577,6 +1380,10 @@ PairwiseAlignmentParameters *pairwiseAlignmentBandingParameters_construct() {
 #if defined(_OPENMP) && defined(PECAN_LOCK_POPEN)
     omp_init_lock(&(p->lastzLock));
 #endif
+    p->useMumAnchors = 1;
+    p->recursiveMums = 1;
+    p->k = 50;
+    p->u = 1;
 
     return p;
 }
@@ -1717,7 +1524,7 @@ void getAlignedPairsWithIndelsUsingAnchors(StateMachine *sM, const char *sX, con
 
 stList *getAlignedPairs(StateMachine *sM, const char *sX, const char *sY, PairwiseAlignmentParameters *p, bool alignmentHasRaggedLeftEnd,
                         bool alignmentHasRaggedRightEnd) {
-    stList *anchorPairs = getBlastPairsForPairwiseAlignmentParameters(sX, sY, strlen(sX), strlen(sY), p);
+    stList *anchorPairs = getAnchorPairsForPairwiseAlignmentParameters(sX, sY, strlen(sX), strlen(sY), p);
     stList *alignedPairs = getAlignedPairsUsingAnchors(sM, sX, sY, anchorPairs, p, alignmentHasRaggedLeftEnd,
                                                        alignmentHasRaggedRightEnd);
     stList_destruct(anchorPairs);
@@ -1727,7 +1534,7 @@ stList *getAlignedPairs(StateMachine *sM, const char *sX, const char *sY, Pairwi
 void getAlignedPairsWithIndels(StateMachine *sM, const char *sX, const char *sY, PairwiseAlignmentParameters *p,
                                stList **alignedPairs, stList **gapXPairs, stList **gapYPairs,
                                bool alignmentHasRaggedLeftEnd, bool alignmentHasRaggedRightEnd) {
-    stList *anchorPairs = getBlastPairsForPairwiseAlignmentParameters(sX, sY, strlen(sX), strlen(sY), p);
+    stList *anchorPairs = getAnchorPairsForPairwiseAlignmentParameters(sX, sY, strlen(sX), strlen(sY), p);
     getAlignedPairsWithIndelsUsingAnchors(sM, sX, sY, anchorPairs, p,
                                           alignedPairs, gapXPairs, gapYPairs,
                                           alignmentHasRaggedLeftEnd, alignmentHasRaggedRightEnd);
@@ -1743,7 +1550,7 @@ void getExpectationsUsingAnchors(StateMachine *sM, Hmm *hmmExpectations, const c
 
 void getExpectations(StateMachine *sM, Hmm *hmmExpectations, const char *sX, const char *sY, PairwiseAlignmentParameters *p,
                      bool alignmentHasRaggedLeftEnd, bool alignmentHasRaggedRightEnd) {
-    stList *anchorPairs = getBlastPairsForPairwiseAlignmentParameters(sX, sY, strlen(sX), strlen(sY), p);
+    stList *anchorPairs = getAnchorPairsForPairwiseAlignmentParameters(sX, sY, strlen(sX), strlen(sY), p);
     getExpectationsUsingAnchors(sM, hmmExpectations, sX, sY, anchorPairs, p, alignmentHasRaggedLeftEnd,
                                 alignmentHasRaggedRightEnd);
     stList_destruct(anchorPairs);
@@ -2024,6 +1831,291 @@ stList *getShiftedMEAAlignment(char *seqX, char *seqY, stList *anchorAlignment, 
     stList_destruct(alignment);
 
     return leftShiftedAlignment;
+}
+
+///////////////////////////////////
+///////////////////////////////////
+// Following functions used maximal unique matches (MUMs) to generate alignment anchors.
+///////////////////////////////////
+///////////////////////////////////
+
+struct sortKmersArgs {
+    const char *sequence;
+    int64_t k;
+};
+
+int cmpKmers(const char *k1, const char *k2, int64_t k, int64_t *matchLength) {
+    for(int64_t i=0; i<k; i++) {
+        if(tolower(k1[i]) < tolower(k2[i])) {
+            *matchLength = i;
+            return -1;
+        }
+        if(tolower(k1[i]) > tolower(k2[i])) {
+            *matchLength = i;
+            return 1;
+        }
+    }
+    *matchLength = k;
+    return 0;
+}
+
+/* converts pointer to pointer into pointer to element */
+static int sortKmersCmpFn(const void *a, const void *b, void* args) {
+    struct sortKmersArgs *sargs = (struct sortKmersArgs *)args;
+    int64_t m; // dummy variable used to store match length
+    return cmpKmers(&(sargs->sequence[*(int64_t *)a]), &(sargs->sequence[*(int64_t *)b]), sargs->k, &m);
+}
+
+/*
+ * Simple/crappy method to build a suffix array like object.
+ */
+static int64_t *getSortedKmers(const char *sequence, const int64_t length, const int64_t k) {
+    if(length - k + 1 <= 0) {
+        return NULL;
+    }
+    int64_t *sortedKmers = st_malloc(sizeof(int64_t) * (length - k + 1));
+
+    // Initialize the array with the start indices of the kmers in the sequence
+    for(int64_t i=0; i<length-k+1; i++) {
+        sortedKmers[i] = i;
+    }
+
+    // Now sort the kmers by kmer content
+    struct sortKmersArgs args = {sequence, k};
+    safesort(sortedKmers, length-k+1, sizeof(int64_t), sortKmersCmpFn, &args);
+
+    return sortedKmers;
+}
+
+static int64_t getMatchLength(int64_t *sortedTargetSuffixes, int64_t targetLength, const char *targetSequence,
+                              const char *searchSequence, int64_t k, int64_t m) {
+    if(m < 0 || m >= targetLength) {
+        return 0;
+    }
+    cmpKmers(searchSequence, &targetSequence[sortedTargetSuffixes[m]], k, &m);
+    return m;
+}
+
+/*
+ * Returns the index of the unique longest match in the target sequence, if it exists. If there is no
+ * unique longest match then returns -1.
+ */
+int64_t getLongestUniqueMatch(int64_t *sortedTargetSuffixes, int64_t targetLength, const char *targetSequence,
+                              const char *searchSequence, int64_t k, int64_t u, int64_t *matchLength) {
+    // First use binary search to find the index of the longest match in the target
+    int64_t l=0, h=targetLength, p; // interval (l, h) that item can be in, l is inclusive, h is exclusive
+    *matchLength = 0; // Set the match length to be 0, initially
+    while(l < h) {
+        int64_t m = (l + h) / 2, n; // Mid point
+        int64_t i = cmpKmers(searchSequence, &targetSequence[sortedTargetSuffixes[m]], k, &n);
+        if(n > *matchLength) { // Update the longest match seen so far
+            *matchLength = n;
+            p = m;
+        }
+        if(i < 0) { // Item must occur before m in the list
+            h = m;
+        }
+        else if(i > 0) { // Item must occur after m in the list
+            l = m+1;
+        } else { // else item at index i equals i, so break
+            break;
+        }
+    }
+
+    // Now check the match is longer than the surrounding matches
+    return (*matchLength > u + getMatchLength(sortedTargetSuffixes, targetLength, targetSequence, searchSequence, k, p - 1) &&
+            *matchLength > u + getMatchLength(sortedTargetSuffixes, targetLength, targetSequence, searchSequence, k, p + 1)) ? p : -1;
+}
+
+/*
+ * Struct to represent an aligned mum.
+ */
+typedef struct _mum Mum;
+struct _mum {
+    int64_t x, y, length, score, refCount;
+    Mum *pMum; // The previous mum in the alignment
+};
+
+static Mum *mum_construct(int64_t x, int64_t y, int64_t length) {
+    Mum *mum = st_calloc(1, sizeof(Mum));
+    mum->x = x;
+    mum->y = y;
+    mum->length = length;
+    mum->refCount = 1;
+    return mum;
+}
+
+void mum_destruct(Mum *mum) {
+    assert(mum->refCount > 0);
+    mum->refCount--;
+    if(mum->refCount == 0) {
+        if(mum->pMum != NULL) {
+            mum_destruct(mum->pMum);
+        }
+        free(mum);
+    }
+}
+
+/*
+ * Compare mums by y start-coordinate.
+ */
+static int mum_sweep_cmp(const void *a, const void *b) {
+    int64_t y1 = ((Mum *)a)->y + ((Mum *)a)->length, y2 = ((Mum *)b)->y + ((Mum *)b)->length;
+    return y1 > y2 ? 1 : (y1 < y2 ? -1 : 0);
+}
+
+/*
+ * Adds new mums the sweep line, destroys the mumsToAdd list and returns an updated mumsToAdd list in the
+ * process.
+ */
+stList *updateSweepLine(stSortedSet *sweepLine, stList *mumsToAdd, int64_t x) {
+    stList *mumsToAdd2 = stList_construct();
+    for(int64_t i=0; i<stList_length(mumsToAdd); i++) {
+        Mum *mum = stList_get(mumsToAdd, i);
+
+        // Skip the mum if it doesn't end at x
+        if(mum->x + mum->length != x) {
+            stList_append(mumsToAdd2, mum);
+            continue;
+        }
+
+        // Check if it is lower scoring than an existing alignment that precedes it on the sweep line
+        Mum *mum2 = stSortedSet_searchLessThanOrEqual(sweepLine, mum);
+        if(mum2 != NULL && mum2->score >= mum->score) {
+            // In this case we don't need to include it, so we delete it and continue
+            mum_destruct(mum);
+            continue;
+        }
+
+        // Remove any points that are eclipsed by the new mum
+        while(1) {
+            Mum *mum2 = stSortedSet_searchGreaterThanOrEqual(sweepLine, mum);
+            if(mum2 == NULL || mum2->score > mum->score) { // If there is no further mum, or its score is larger
+                // than the mum being added
+                break;
+            }
+            mum_destruct(stSortedSet_remove(sweepLine, mum2));
+        }
+
+        // Now we can add the new mum to the sweep line
+        stSortedSet_insert(sweepLine, mum);
+    }
+    stList_destruct(mumsToAdd);
+    return mumsToAdd2;
+}
+
+/*
+ * Chains the mum with the highest scoring preceding mum
+ * Does not currently account for gap penalties.
+ */
+static void chainMum(stSortedSet *sweepLine, Mum *mum) {
+    Mum m; m.length = 0; m.y = mum->y;
+    mum->pMum = stSortedSet_searchLessThan(sweepLine, &m);
+    if(mum->pMum == NULL) {
+        mum->score = mum->length;
+        return;
+    }
+    assert(mum->x - mum->pMum->x - mum->pMum->length >= 0);
+    assert(mum->y - mum->pMum->y - mum->pMum->length >= 0);
+    mum->pMum->refCount++;
+    mum->score = mum->pMum->score + mum->length;
+}
+
+static void getAlignedMums2(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p,
+                            int64_t oX, int64_t oY, bool recursive, stList *alignedPairs);
+
+/*
+ * Traces back the highest scoring alignment of mums to create set of aligned pairs.
+ */
+static void tracebackMums(stSortedSet *sweepLine,
+                          const char *sX, const char *sY, int64_t lX, int64_t lY,
+                          PairwiseAlignmentParameters *p,
+                          int64_t oX, int64_t oY, bool recursive, stList *alignedPairs) {
+    Mum *mum = stSortedSet_getLast(sweepLine);
+    while(mum != NULL) { // traceback from last-to-first mum
+        if(recursive) {
+            int64_t i = mum->x + mum->length;
+            int64_t j = mum->y + mum->length;
+            assert(lX - i >= 0 && lY - j >= 0);
+            if((lX - i) * (lY - j) > p->anchorMatrixBiggerThanThis) {
+                getAlignedMums2(&sX[i], &sY[j], lX-i, lY-j, p, oX + i, oY + j, 0, alignedPairs);
+            }
+        }
+        for(int64_t i=mum->length-1; i>=0; i--) { // go backwards, so that when we reverse order pairs will be increasing
+            stList_append(alignedPairs, stIntTuple_construct3(oX + mum->x+i, oY + mum->y+i, p->diagonalExpansion));
+        }
+        lX = mum->x; lY = mum->y;
+        mum = mum->pMum;
+    }
+    if(recursive) {
+        if (lX * lY > p->anchorMatrixBiggerThanThis) { // Deal with the gap between the start and the first mum
+            getAlignedMums2(sX, sY, lX, lY, p, oX, oY, 0, alignedPairs);
+        }
+        stList_reverse(alignedPairs); // reverse to get in first-to-last order, but only at the top-level, so we don't
+        // do it twice
+    }
+}
+
+static void getAlignedMums2(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p,
+                            int64_t oX, int64_t oY, bool recursive, stList *alignedPairs) {
+    // Get the kmers in each sequence sorted lexicographically
+    int64_t *sortedKmersY = getSortedKmers(sY, lY, p->k);
+
+    stSortedSet *sweepLine = stSortedSet_construct3(mum_sweep_cmp, (void (*)(void *))mum_destruct);
+    stList *mumsToAdd = stList_construct();
+
+    int64_t pDiag=-1, pXEnd=-1;
+    for(int64_t x=0; x<lX-p->k+1; x++) {
+        // Add any mums that end at x to the sweep line
+        mumsToAdd = updateSweepLine(sweepLine, mumsToAdd, x);
+
+        // Get the next longest unique match
+        int64_t matchLength;
+        int64_t j = getLongestUniqueMatch(sortedKmersY, lY-p->k+1, sY, &sX[x], p->k, p->u, &matchLength);
+
+        // If is a longest unique match
+        if(j >= 0 && j < lY-p->k+1) {
+            int64_t y = sortedKmersY[j]; // The y coordinate of the start of the match
+            if(pXEnd < x || pDiag != x - y) { // If not part of the previous match then is a MUM
+                // Make a mum
+                Mum *mum = mum_construct(x, y, matchLength);
+
+                // Add the mum to it's best alignment
+                chainMum(sweepLine, mum);
+
+                //st_uglyf("Got mum, x: %i, y: %i, length: %i, pMum: %i\n", (int)mum->x, (int)mum->y,
+                //         (int)mum->length, (int)mum->pMum);
+
+                // Queue the mum up to add the sweep line when we get to its end x-coordinate
+                stList_append(mumsToAdd, mum);
+
+                // Update the coordinates of the last found mum
+                pDiag = x - y;
+                pXEnd = x + matchLength;
+            }
+        }
+    }
+
+    for(int64_t x=lX-p->k+1; x<lX; x++) {
+        // Finish adding the mums to the sweep line
+        mumsToAdd = updateSweepLine(sweepLine, mumsToAdd, x);
+    }
+
+    // Get highest scoring chain
+    tracebackMums(sweepLine, sX, sY, lX, lY, p, oX, oY, recursive, alignedPairs);
+
+    // cleanup
+    free(sortedKmersY);
+    assert(stList_length(mumsToAdd) == 0);
+    stList_destruct(mumsToAdd);
+    stSortedSet_destruct(sweepLine);
+}
+
+stList *getAlignedMums(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p,
+                       int64_t oX, int64_t oY) {
+    stList *alignedPairs = stList_construct3(0, (void (*)(void *))stIntTuple_destruct);
+    getAlignedMums2(sX, sY, lX, lY, p, oX, oY, p->recursiveMums, alignedPairs);
+    return alignedPairs;
 }
 
 
