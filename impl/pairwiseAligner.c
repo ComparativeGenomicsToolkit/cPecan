@@ -1947,8 +1947,7 @@ static Mum *mum_construct(int64_t x, int64_t y, int64_t length) {
 
 void mum_destruct(Mum *mum) {
     assert(mum->refCount > 0);
-    mum->refCount--;
-    if(mum->refCount == 0) {
+    if(--(mum->refCount) == 0) {
         if(mum->pMum != NULL) {
             mum_destruct(mum->pMum);
         }
@@ -1994,11 +1993,16 @@ stList *updateSweepLine(stSortedSet *sweepLine, stList *mumsToAdd, int64_t x) {
                 // than the mum being added
                 break;
             }
-            mum_destruct(stSortedSet_remove(sweepLine, mum2));
+            assert(stSortedSet_search(sweepLine, mum2) == mum2);
+            stSortedSet_remove(sweepLine, mum2);
+            assert(stSortedSet_search(sweepLine, mum2) == NULL);
+            mum_destruct(mum2);
         }
 
         // Now we can add the new mum to the sweep line
+        assert(stSortedSet_search(sweepLine, mum) == NULL);
         stSortedSet_insert(sweepLine, mum);
+        assert(stSortedSet_search(sweepLine, mum) == mum);
     }
     stList_destruct(mumsToAdd);
     return mumsToAdd2;
@@ -2096,7 +2100,7 @@ static void getAlignedMums2(const char *sX, const char *sY, int64_t lX, int64_t 
         }
     }
 
-    for(int64_t x=lX-p->k+1; x<lX; x++) {
+    for(int64_t x=lX-p->k+1; x<=lX; x++) {
         // Finish adding the mums to the sweep line
         mumsToAdd = updateSweepLine(sweepLine, mumsToAdd, x);
     }
