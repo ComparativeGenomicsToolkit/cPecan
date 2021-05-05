@@ -1190,9 +1190,6 @@ static void getBlastPairsForPairwiseAlignmentParametersP(const char *sX, const c
 
 stList *getBlastPairsForPairwiseAlignmentParameters(const char *sX, const char *sY, const int64_t lX, const int64_t lY,
                                                     PairwiseAlignmentParameters *p) {
-    if ((int64_t) lX * lY <= p->anchorMatrixBiggerThanThis) {
-        return stList_construct();
-    }
     //Anchor pairs
     stList *topLevelAnchorPairs = getBlastPairs(sX, sY, lX, lY, p, 1);
     st_logDebug("Got %" PRIi64 " top level anchor pairs \n", stList_length(topLevelAnchorPairs));
@@ -1222,6 +1219,9 @@ stList *getBlastPairsForPairwiseAlignmentParameters(const char *sX, const char *
 
 stList *getAnchorPairsForPairwiseAlignmentParameters(const char *sX, const char *sY, const int64_t lX, const int64_t lY,
                                                     PairwiseAlignmentParameters *p) {
+    if ((int64_t) lX * lY <= p->anchorMatrixBiggerThanThis) {
+        return stList_construct();
+    }
     if(p->useMumAnchors) {
         return getAlignedMums(sX, sY, lX, lY, p, 0, 0);
     }
