@@ -47,6 +47,10 @@ typedef struct _pairwiseAlignmentBandingParameters {
     omp_lock_t lastzLock; // This lock used to gate access to calling out to lastz
     omp_lock_t lastzLock2; // This lock used to gate access to temp files used to communicate with lastz
 #endif
+    bool useMumAnchors;
+    int64_t k; // k-mer length used by MUM anchoring approach
+    int64_t u; // a MUM must be 1 + u longer than any other match to be considered unique
+    int64_t recursiveMums; // anchor recursively
 } PairwiseAlignmentParameters;
 
 PairwiseAlignmentParameters *pairwiseAlignmentBandingParameters_construct();
@@ -257,6 +261,11 @@ void getPosteriorProbsWithBanding(StateMachine *sM, stList *anchorPairs, const S
               double, PairwiseAlignmentParameters *, void *), void *extraArgs);
 
 //Blast pairs
+
+int cmpKmers(const char *k1, const char *k2, int64_t k, int64_t *matchLength);
+
+stList *getAlignedMums(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p,
+                       int64_t offsetX, int64_t offsetY);
 
 stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p, bool repeatMask);
 
