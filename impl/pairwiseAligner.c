@@ -7,7 +7,9 @@
 #include "safesort.h"
 
 //This is being included to make popen work!
-#define _XOPEN_SOURCE 500
+#ifndef _XOPEN_SOURCE
+# define _XOPEN_SOURCE 500
+#endif
 
 #include <stdlib.h>
 #include <stdio.h>
