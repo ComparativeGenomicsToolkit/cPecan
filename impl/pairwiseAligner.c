@@ -1905,7 +1905,7 @@ static int64_t getMatchLength(int64_t *sortedTargetSuffixes, int64_t targetLengt
 int64_t getLongestUniqueMatch(int64_t *sortedTargetSuffixes, int64_t targetLength, const char *targetSequence,
                               const char *searchSequence, int64_t k, int64_t u, int64_t *matchLength) {
     // First use binary search to find the index of the longest match in the target
-    int64_t l=0, h=targetLength, p; // interval (l, h) that item can be in, l is inclusive, h is exclusive
+    int64_t l=0, h=targetLength, p=-2; // interval (l, h) that item can be in, l is inclusive, h is exclusive
     *matchLength = 0; // Set the match length to be 0, initially
     while(l < h) {
         int64_t m = (l + h) / 2, n; // Mid point
