@@ -87,6 +87,35 @@ void compareToTrueAlignment(CuTest *testCase, stSortedSet *pairs, char *align1, 
     stSortedSet_destruct(pairs2);
 }
 
+static void test_pairwiseAlignerMumRandomAnchors(CuTest *testCase) {
+    /*
+     * Test mum anchors on random sequences
+     */
+    int64_t nLength = 1000000;
+    //char *stRandom_getRandomDNAString(int64_t length, bool includeNs, bool useLowerCase, bool useRandomCase)
+    char *seq1 = stRandom_getRandomDNAString(nLength, 0, 0, 0);
+    char *seq2 = stRandom_getRandomDNAString(nLength, 0, 0, 0);
+    PairwiseAlignmentParameters *p = pairwiseAlignmentBandingParameters_construct();
+    time_t startTime = time(NULL);
+    stList *alignedMums = getAlignedMums(seq1, seq2, nLength, nLength, p, 0, 0);
+st_logInfo("I have %i shared, aligned mums (k=%i) comparing random sequences in %f seconds\n", (int)stList_length(alignedMums), (int)p->k, (double)(time(NULL) - startTime));
+}
+
+static void test_pairwiseAlignerMumNAnchors(CuTest *testCase) {
+    /*
+     * Test mum anchors on long stretches of Ns
+     */
+    int64_t nLength = 1000000;
+    char *seq = st_malloc(sizeof(char) * nLength);
+    for(int64_t i=0; i<nLength; i++) {
+        seq[i] = 'A';
+    }
+    PairwiseAlignmentParameters *p = pairwiseAlignmentBandingParameters_construct();
+    time_t startTime = time(NULL);
+    stList *alignedMums = getAlignedMums(seq, seq, nLength, nLength, p, 0, 0);
+    st_logInfo("I have %i shared, aligned mums (k=%i) comparing N sequences in %f seconds\n", (int)stList_length(alignedMums), (int)p->k, (double)(time(NULL) - startTime));
+}
+
 static void test_pairwiseAlignerMumAnchors(CuTest *testCase, char *seq1, char *seq2, char *align1, char *align2,
                                             char *seqName1, char *seqName2) {
     PairwiseAlignmentParameters *p = pairwiseAlignmentBandingParameters_construct();
@@ -177,6 +206,8 @@ static void test_pairwiseAligner_LongHumanDog(CuTest *testCase) {
 
 CuSuite* pairwiseAlignmentLongTestSuite(void) {
     CuSuite* suite = CuSuiteNew();
+    SUITE_ADD_TEST(suite, test_pairwiseAlignerMumRandomAnchors);
+    SUITE_ADD_TEST(suite, test_pairwiseAlignerMumNAnchors);
     SUITE_ADD_TEST(suite, test_pairwiseAligner_LongHumanDog);
     SUITE_ADD_TEST(suite, test_pairwiseAligner_LongHumanChimp);
     SUITE_ADD_TEST(suite, test_pairwiseAligner_LongHumanMouse);
