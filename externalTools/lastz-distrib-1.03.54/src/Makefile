@@ -68,7 +68,7 @@ VERSION_FLAGS= \
 
 
 CFLAGS += -O3 ${definedForAll} ${VERSION_FLAGS}
-
+LDFLAGS += -O3 ${definedForAll} ${VERSION_FLAGS}
 
 srcFiles = lastz infer_scores \
            seeds pos_table quantum seed_search diag_hash                  \
@@ -97,13 +97,13 @@ incFiles = lastz.h infer_scores.h \
 
 
 lastz: $(foreach part,${srcFiles},${part}.o)
-	${CC} $(foreach part,${srcFiles},${part}.o) -lm ${CFLAGS} -o $@
+	${CC} $(foreach part,${srcFiles},${part}.o) -lm ${LDFLAGS} -o $@
 
 lastz_D: $(foreach part,${srcFiles},${part}_D.o)
-	${CC} $(foreach part,${srcFiles},${part}_D.o) -lm ${CFLAGS} -o $@
+	${CC} $(foreach part,${srcFiles},${part}_D.o) -lm ${LDFLAGS} -o $@
 
 lastz_32: $(foreach part,${srcFiles},${part}_32.o)
-	${CC} $(foreach part,${srcFiles},${part}_32.o) -lm ${CFLAGS} -o $@
+	${CC} $(foreach part,${srcFiles},${part}_32.o) -lm ${LDFLAGS} -o $@
 
 # cleanup
 
