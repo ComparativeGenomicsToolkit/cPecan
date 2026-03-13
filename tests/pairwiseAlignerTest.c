@@ -1092,6 +1092,7 @@ void test_hmm_3StateAsymmetric(CuTest *testCase) {
 }
 
 void test_em(CuTest *testCase, StateMachineType stateMachineType) {
+    bool needs_debugged_warning = true;
     for (int64_t test = 0; test < 100; test++) {
         //Make a pair of sequences
         char *sX = getRandomSequence(st_randomInt(10, 100));
@@ -1134,8 +1135,11 @@ void test_em(CuTest *testCase, StateMachineType stateMachineType) {
             assert(pLikelihood <= hmm->likelihood * 0.95);
             CuAssertTrue(testCase, pLikelihood <= hmm->likelihood * 0.95);
 #else
-            fprintf(stderr,  "WARNING WARNING WARNING test_em failure that needs debugged: pLikelihood <= hmm->likelihood * 0.95; %g <= %g (%g * 0.95)\n",
-                    pLikelihood, hmm->likelihood * 0.95, hmm->likelihood);
+            if (needs_debugged_warning == true) {
+                fprintf(stderr,  "WARNING WARNING WARNING test_em failure that needs debugged: pLikelihood <= hmm->likelihood * 0.95; %g <= %g (%g * 0.95)\n",
+                        pLikelihood, hmm->likelihood * 0.95, hmm->likelihood);
+                needs_debugged_warning = false;
+            }
 #endif
             
             pLikelihood = hmm->likelihood;
