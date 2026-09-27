@@ -525,6 +525,9 @@ void test_filterToRemoveOverlap(CuTest *testCase) {
             int64_t y = stIntTuple_get(pair, 1);
             bool nonOverlapping = 1;
             for (int64_t j = 0; j < stList_length(pairs); j++) {
+                if (j == i) { // a pair does not overlap itself -- without this every pair did, and the expected set was always empty
+                    continue;
+                }
                 stIntTuple *pair2 = stList_get(pairs, j);
                 int64_t x2 = stIntTuple_get(pair2, 0);
                 int64_t y2 = stIntTuple_get(pair2, 1);
@@ -1201,6 +1204,122 @@ void test_computeForwardProbability(CuTest *testCase) {
 	}
 }
 
+/*
+ * A posterior callback the fast path does not recognise, so getPosteriorProbsWithBanding takes the
+ * original log space route with it.
+ */
+static void logSpacePosteriorMatchProbs(StateMachine *sM, int64_t xay, DpMatrix *forwardDpMatrix, DpMatrix *backwardDpMatrix,
+                                        const SymbolString sX, const SymbolString sY, double totalProbability,
+                                        PairwiseAlignmentParameters *p, void *extraArgs) {
+    diagonalCalculationPosteriorMatchProbs(sM, xay, forwardDpMatrix, backwardDpMatrix, sX, sY, totalProbability, p, extraArgs);
+}
+
+static void checkPosteriorsAgree(CuTest *testCase, stList *pairs, stList *otherPairs, double minProb, double tolerance) {
+    stHash *other = stHash_construct3((uint64_t (*)(const void *)) stIntTuple_hashKey,
+                                      (int (*)(const void *, const void *)) stIntTuple_equalsFn,
+                                      (void (*)(void *)) stIntTuple_destruct, NULL);
+    for (int64_t i = 0; i < stList_length(otherPairs); i++) {
+        stIntTuple *pair = stList_get(otherPairs, i);
+        stHash_insert(other, stIntTuple_construct2(stIntTuple_get(pair, 1), stIntTuple_get(pair, 2)), pair);
+    }
+    for (int64_t i = 0; i < stList_length(pairs); i++) {
+        stIntTuple *pair = stList_get(pairs, i);
+        double prob = (double) stIntTuple_get(pair, 0) / PAIR_ALIGNMENT_PROB_1;
+        stIntTuple *key = stIntTuple_construct2(stIntTuple_get(pair, 1), stIntTuple_get(pair, 2));
+        stIntTuple *otherPair = stHash_search(other, key);
+        stIntTuple_destruct(key);
+        if (prob >= minProb) {
+            CuAssertTrue(testCase, otherPair != NULL);
+        }
+        if (otherPair != NULL) {
+            double otherProb = (double) stIntTuple_get(otherPair, 0) / PAIR_ALIGNMENT_PROB_1;
+            CuAssertTrue(testCase, fabs(prob - otherProb) <= tolerance);
+        }
+    }
+    stHash_destruct(other);
+}
+
+void test_fastPosteriorsMatchLogSpace(CuTest *testCase) {
+    /*
+     * The probability space forward-backward against the log space one it replaced, over random
+     * bands, traceback settings, ragged ends and state machines.  They differ only by the error of
+     * the log space version's approximate log-add, a few thousandths.  The last few are long and
+     * unanchored, which is what makes the fast path recompute its forward values in blocks.
+     */
+    StateMachineType types[4] = { fiveState, fiveStateAsymmetric, threeState, threeStateAsymmetric };
+    for (int64_t test = 0; test < 60; test++) {
+        bool long_ = test >= 56;
+        char *sX = getRandomSequence(long_ ? st_randomInt(1000, 1500) : st_randomInt(0, 150));
+        char *sY = evolveSequence(sX);
+        int64_t lX = strlen(sX), lY = strlen(sY);
+        SymbolString sX2 = symbolString_construct(sX, lX);
+        SymbolString sY2 = symbolString_construct(sY, lY);
+        PairwiseAlignmentParameters *p = pairwiseAlignmentBandingParameters_construct();
+        p->traceBackDiagonals = st_randomInt(1, 10);
+        p->minDiagsBetweenTraceBack = p->traceBackDiagonals + st_randomInt(2, 10);
+        p->diagonalExpansion = st_randomInt(0, 10) * 2;
+        p->dynamicAnchorExpansion = st_random() > 0.5;
+        StateMachineType type = types[st_randomInt(0, 4)];
+        StateMachine *sM = type == fiveState || type == fiveStateAsymmetric ? stateMachine5_construct(type) : stateMachine3_construct(type);
+        stList *anchorPairs = long_ ? stList_construct3(0, (void (*)(void *)) stIntTuple_destruct) : getRandomAnchorPairs(lX, lY);
+        bool raggedLeft = st_random() > 0.5, raggedRight = st_random() > 0.5;
+
+        stList *fastPairs = stList_construct3(0, (void (*)(void *)) stIntTuple_destruct);
+        stList *logPairs = stList_construct3(0, (void (*)(void *)) stIntTuple_destruct);
+        void *fastArgs[1] = { fastPairs }, *logArgs[1] = { logPairs };
+        getPosteriorProbsWithBanding(sM, anchorPairs, sX2, sY2, p, raggedLeft, raggedRight, diagonalCalculationPosteriorMatchProbs, fastArgs);
+        getPosteriorProbsWithBanding(sM, anchorPairs, sX2, sY2, p, raggedLeft, raggedRight, logSpacePosteriorMatchProbs, logArgs);
+        st_logInfo("Fast and log space posteriors for lengths %" PRIi64 " and %" PRIi64 ": %" PRIi64 " and %" PRIi64 " pairs\n",
+                   lX, lY, stList_length(fastPairs), stList_length(logPairs));
+        checkAlignedPairs(testCase, fastPairs, lX, lY, 0, 0);
+        checkPosteriorsAgree(testCase, fastPairs, logPairs, 0.05, 0.02);
+        checkPosteriorsAgree(testCase, logPairs, fastPairs, 0.05, 0.02);
+
+        stList_destruct(fastPairs);
+        stList_destruct(logPairs);
+        stList_destruct(anchorPairs);
+        stateMachine_destruct(sM);
+        pairwiseAlignmentBandingParameters_destruct(p);
+        free(sX);
+        free(sY);
+        free(sX2.sequence);
+        free(sY2.sequence);
+    }
+}
+
+void test_getSeedAnchors(CuTest *testCase) {
+    /*
+     * The anchors are in range, strictly increasing in both sequences, and for a sequence against
+     * itself all on the one diagonal.
+     */
+    for (int64_t test = 0; test < 20; test++) {
+        // Half against an evolved copy, half against itself.  getRandomSequence is half lower case,
+        // which seeds do not start in, so the copies against themselves are upper case throughout.
+        char *seqX = test % 2 == 0 ? getRandomSequence(st_randomInt(0, 20000)) : getRandomACGTSequence(st_randomInt(0, 20000));
+        char *seqY = test % 2 == 0 ? evolveSequence(seqX) : stString_copy(seqX);
+        int64_t lX = strlen(seqX), lY = strlen(seqY);
+        PairwiseAlignmentParameters *p = pairwiseAlignmentBandingParameters_construct();
+        p->constraintDiagonalTrim = st_randomInt(0, 15);
+        p->diagonalExpansion = st_randomInt(0, 5) * 2;
+        stList *anchors = getSeedAnchors(seqX, seqY, lX, lY, p);
+        st_logInfo("Got %" PRIi64 " seed anchors for lengths %" PRIi64 " and %" PRIi64 "\n", stList_length(anchors), lX, lY);
+        checkBlastPairs(testCase, anchors, lX, lY, p->diagonalExpansion, 1);
+        if (test % 2 == 1) {
+            for (int64_t i = 0; i < stList_length(anchors); i++) {
+                stIntTuple *anchor = stList_get(anchors, i);
+                CuAssertIntEquals(testCase, stIntTuple_get(anchor, 0), stIntTuple_get(anchor, 1));
+            }
+            if (lX > 1000) { // a random sequence against itself has plenty to anchor on
+                CuAssertTrue(testCase, stList_length(anchors) > lX / 2);
+            }
+        }
+        stList_destruct(anchors);
+        free(seqX);
+        free(seqY);
+        pairwiseAlignmentBandingParameters_destruct(p);
+    }
+}
+
 CuSuite* pairwiseAlignmentTestSuite(void) {
     CuSuite* suite = CuSuiteNew();
 
@@ -1213,6 +1332,8 @@ CuSuite* pairwiseAlignmentTestSuite(void) {
     SUITE_ADD_TEST(suite, test_dpMatrix);
     SUITE_ADD_TEST(suite, test_diagonalDPCalculations);
     SUITE_ADD_TEST(suite, test_getAlignedPairsWithBanding);
+    SUITE_ADD_TEST(suite, test_fastPosteriorsMatchLogSpace);
+    SUITE_ADD_TEST(suite, test_getSeedAnchors);
     SUITE_ADD_TEST(suite, test_getBlastPairs);
     SUITE_ADD_TEST(suite, test_getBlastPairsWithRecursion);
     SUITE_ADD_TEST(suite, test_filterToRemoveOverlap);

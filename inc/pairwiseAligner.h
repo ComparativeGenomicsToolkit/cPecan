@@ -51,7 +51,15 @@ typedef struct _pairwiseAlignmentBandingParameters {
     int64_t k; // k-mer length used by MUM anchoring approach
     int64_t u; // a MUM must be 1 + u longer than any other match to be considered unique
     int64_t recursiveMums; // anchor recursively
+    int64_t anchorMethod; // PAIRWISE_ANCHOR_SEED, or PAIRWISE_ANCHOR_LEGACY to use lastz or MUMs as useMumAnchors says
+    int64_t seedHspThreshold; // HOXD70 score an ungapped seed extension needs to be an anchor candidate (seed anchoring)
+    int64_t seedHspThresholdMin; // the least that threshold falls to in the small gaps between anchors (seed anchoring)
+    int64_t seedRecursionDepth; // how many levels of gaps between anchors are searched again (seed anchoring)
+    int64_t seedXDrop; // x-drop for the ungapped extensions (seed anchoring)
 } PairwiseAlignmentParameters;
+
+#define PAIRWISE_ANCHOR_LEGACY 0
+#define PAIRWISE_ANCHOR_SEED 1
 
 PairwiseAlignmentParameters *pairwiseAlignmentBandingParameters_construct();
 
@@ -266,6 +274,13 @@ int cmpKmers(const char *k1, const char *k2, int64_t k, int64_t *matchLength);
 
 stList *getAlignedMums(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p,
                        int64_t offsetX, int64_t offsetY);
+
+/*
+ * Anchors from spaced seeds, ungapped extension and chaining, done in process: the same kind of
+ * anchors as the lastz call makes, without the process.  Returns (x, y, expansion) tuples,
+ * strictly increasing in both x and y.
+ */
+stList *getSeedAnchors(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p);
 
 stList *getBlastPairs(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p, bool repeatMask);
 

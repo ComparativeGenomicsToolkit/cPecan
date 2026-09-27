@@ -757,6 +757,793 @@ static void diagonalCalculationExpectations(StateMachine *sM, int64_t xay, DpMat
 
 ///////////////////////////////////
 ///////////////////////////////////
+//Fast banded forward-backward
+//
+//The log space recursion below goes through three levels of function pointer per cell (the
+//diagonal, the cell and the transition) and an approximate log-add per transition.  For the
+//posterior probabilities -- which is all bar asks for -- the same banded, chunked recursion is
+//computed here in probability space instead: each diagonal is rescaled so its largest value is
+//one and the scale is kept as a log, the state machine is flattened into arrays once per call,
+//and each state of a diagonal is a plain loop over its cells.  The band, the traceback points
+//and which diagonals get posteriors in which chunk are exactly those of the log space version;
+//only the arithmetic differs, and this is the more accurate of the two, since logAdd is a
+//piecewise cubic fit that also drops any term under e^-7.5 of the larger.
+///////////////////////////////////
+///////////////////////////////////
+
+#if defined(__SSE2__)
+#include <xmmintrin.h>
+#endif
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+#define PAIR_HMM_MAX_STATES 5
+
+enum { PAIR_HMM_MATCH = 0, PAIR_HMM_GAP_X = 1, PAIR_HMM_GAP_Y = 2 };
+
+typedef struct _pairHmmTerms { // the nonzero transitions into (or out of) a state
+    int64_t number;
+    int64_t state[PAIR_HMM_MAX_STATES];
+    double t[PAIR_HMM_MAX_STATES];
+} PairHmmTerms;
+
+typedef struct _pairHmm {
+    int64_t stateNumber;
+    int64_t type[PAIR_HMM_MAX_STATES]; // what a state emits: a match, a gap in y (x only) or a gap in x (y only)
+    double t[PAIR_HMM_MAX_STATES][PAIR_HMM_MAX_STATES]; // transition probabilities, [from][to]
+    double eMatch[SYMBOL_NUMBER * SYMBOL_NUMBER], eGapX[SYMBOL_NUMBER], eGapY[SYMBOL_NUMBER];
+    double start[PAIR_HMM_MAX_STATES], raggedStart[PAIR_HMM_MAX_STATES];
+    double end[PAIR_HMM_MAX_STATES], raggedEnd[PAIR_HMM_MAX_STATES];
+    PairHmmTerms into[PAIR_HMM_MAX_STATES], outOf[PAIR_HMM_MAX_STATES]; // t, sparse, by destination and by source
+    bool ok; // false if the state machine does not fit this form, in which case the log space code is used
+} PairHmm;
+
+typedef struct {
+    PairHmm *hmm;
+    double *lower, *middle, *upper;
+    int64_t x, y;
+} PairHmmExtraction;
+
+static void pairHmm_setOnce(double *slot, double value, PairHmm *hmm) {
+    if (*slot < 0.0) {
+        *slot = value;
+    } else if (*slot != value) {
+        hmm->ok = 0;
+    }
+}
+
+/*
+ * A doTransition that records the transition instead of computing with it.  Which neighbour
+ * the transition reads from says what the destination state emits.
+ */
+static void pairHmm_recordTransition(double *fromCells, double *toCells, int64_t from, int64_t to, double eP, double tP,
+                                     void *extraArgs) {
+    PairHmmExtraction *e = extraArgs;
+    PairHmm *hmm = e->hmm;
+    if (from < 0 || from >= hmm->stateNumber || to < 0 || to >= hmm->stateNumber) {
+        hmm->ok = 0;
+        return;
+    }
+    int64_t type = fromCells == e->lower ? PAIR_HMM_GAP_X : (fromCells == e->middle ? PAIR_HMM_MATCH : PAIR_HMM_GAP_Y);
+    if (hmm->type[to] == -1) {
+        hmm->type[to] = type;
+    } else if (hmm->type[to] != type) { // the recursion needs each state entered from one neighbour only
+        hmm->ok = 0;
+    }
+    pairHmm_setOnce(&hmm->t[from][to], exp(tP), hmm); // must not depend on the symbols
+    double *emission = type == PAIR_HMM_MATCH ? &hmm->eMatch[e->x * SYMBOL_NUMBER + e->y] :
+                       (type == PAIR_HMM_GAP_X ? &hmm->eGapX[e->x] : &hmm->eGapY[e->y]);
+    pairHmm_setOnce(emission, exp(eP), hmm); // must not depend on the state transitioned from
+}
+
+/*
+ * Flattens the state machine by running its cell calculation once for every pair of symbols
+ * and recording the transitions, rather than by reading its fields, so it works for any state
+ * machine whose states each emit in one way and whose transitions do not depend on the symbols.
+ */
+static void pairHmm_construct(PairHmm *hmm, StateMachine *sM) {
+    hmm->ok = sM->stateNumber > 0 && sM->stateNumber <= PAIR_HMM_MAX_STATES;
+    if (!hmm->ok) {
+        return;
+    }
+    hmm->stateNumber = sM->stateNumber;
+    for (int64_t s = 0; s < PAIR_HMM_MAX_STATES; s++) {
+        hmm->type[s] = -1;
+        for (int64_t s2 = 0; s2 < PAIR_HMM_MAX_STATES; s2++) {
+            hmm->t[s][s2] = -1.0;
+        }
+    }
+    for (int64_t i = 0; i < SYMBOL_NUMBER * SYMBOL_NUMBER; i++) {
+        hmm->eMatch[i] = -1.0;
+    }
+    for (int64_t i = 0; i < SYMBOL_NUMBER; i++) {
+        hmm->eGapX[i] = -1.0;
+        hmm->eGapY[i] = -1.0;
+    }
+    double current[PAIR_HMM_MAX_STATES], lower[PAIR_HMM_MAX_STATES], middle[PAIR_HMM_MAX_STATES], upper[PAIR_HMM_MAX_STATES];
+    PairHmmExtraction e = { hmm, lower, middle, upper, 0, 0 };
+    for (e.x = 0; e.x < SYMBOL_NUMBER; e.x++) {
+        for (e.y = 0; e.y < SYMBOL_NUMBER; e.y++) {
+            sM->cellCalculate(sM, current, lower, middle, upper, (Symbol) e.x, (Symbol) e.y, pairHmm_recordTransition, &e);
+        }
+    }
+    for (int64_t s = 0; s < hmm->stateNumber; s++) {
+        if (hmm->type[s] == -1) {
+            hmm->ok = 0;
+        }
+        for (int64_t s2 = 0; s2 < hmm->stateNumber; s2++) {
+            if (hmm->t[s][s2] < 0.0) {
+                hmm->t[s][s2] = 0.0; // no such transition
+            }
+        }
+        hmm->start[s] = exp(sM->startStateProb(sM, s));
+        hmm->raggedStart[s] = exp(sM->raggedStartStateProb(sM, s));
+        hmm->end[s] = exp(sM->endStateProb(sM, s));
+        hmm->raggedEnd[s] = exp(sM->raggedEndStateProb(sM, s));
+    }
+    for (int64_t i = 0; i < SYMBOL_NUMBER * SYMBOL_NUMBER; i++) {
+        hmm->ok = hmm->ok && hmm->eMatch[i] >= 0.0;
+    }
+    for (int64_t i = 0; i < SYMBOL_NUMBER; i++) {
+        hmm->ok = hmm->ok && hmm->eGapX[i] >= 0.0 && hmm->eGapY[i] >= 0.0;
+    }
+    for (int64_t s = 0; s < hmm->stateNumber; s++) {
+        hmm->into[s].number = 0;
+        hmm->outOf[s].number = 0;
+    }
+    for (int64_t from = 0; from < hmm->stateNumber; from++) { // in increasing order of state, both ways
+        for (int64_t to = 0; to < hmm->stateNumber; to++) {
+            double t = hmm->t[from][to];
+            if (t > 0.0) {
+                PairHmmTerms *i = &hmm->into[to], *o = &hmm->outOf[from];
+                i->state[i->number] = from;
+                i->t[i->number++] = t;
+                o->state[o->number] = to;
+                o->t[o->number++] = t;
+            }
+        }
+    }}
+
+/*
+ * A diagonal of the scaled dp matrix.  Cells are stored state-major, so the cell for state s
+ * at xmy = xmyL + 2i is cells[s * width + i], and the true value is that times exp(logScale).
+ */
+enum { FAST_STORED, FAST_RING, FAST_BLOCK }; // where a forward diagonal's cells are, see FastForward
+
+typedef struct _fastDiagonal {
+    int64_t xmyL, width;
+    int64_t where, offset; // which buffer holds the cells, and where in it (for the ring, which of its three)
+    double logScale;
+} FastDiagonal;
+
+/*
+ * The dp between one traceback and the next.  A chunk computes forward values for diagonals
+ * (start, end], walks the backward values from end down to tracedBackTo, takes posteriors up
+ * to tracedBackFrom, and hands the forward values from tracedBackFrom on to the next chunk.
+ *
+ * A large chunk does not keep all of its forward diagonals: only the ones it hands on and a
+ * pair before every blockSize'th, from which the walk back recomputes each block of them when
+ * it gets there.  That is a second forward pass over the chunk, but it holds a few hundred
+ * diagonals rather than thousands, and what the walk reads is still in cache.  Keeping them
+ * all, an unanchored 3000x3000 matrix holds 360MB per thread and runs at the speed of memory.
+ */
+typedef struct _fastChunk {
+    int64_t start, end, tracedBackTo, tracedBackFrom;
+    int64_t blockSize; // 0 if every forward diagonal is kept
+} FastChunk;
+
+#define FAST_CHECKPOINT_BYTES (16 * 1024 * 1024) // chunks whose forward values would take more are recomputed in blocks
+
+/*
+ * Whether the chunk keeps diagonal xay's forward values, rather than computing them only to feed
+ * the next two.  Blocks start at start + 1 + j * blockSize.
+ */
+static bool fastChunk_stores(FastChunk *c, int64_t xay) {
+    if (c->blockSize == 0 || xay >= c->tracedBackFrom || xay <= c->start) {
+        return 1;
+    }
+    for (int64_t blockStart = xay + 1; blockStart <= xay + 2; blockStart++) { // the pair before a block
+        if (blockStart > c->start + 1 && blockStart < c->tracedBackFrom && (blockStart - c->start - 1) % c->blockSize == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * The forward diagonals the current chunk holds, and the buffers they are held in.
+ */
+typedef struct _fastForward {
+    FastDiagonal *diagonals; // diagonals[xay - base], for every diagonal of the chunk however it is held
+    int64_t base, length, capacity;
+    double *cells; // FAST_STORED: kept diagonals, contiguous and in order
+    int64_t cellsLength, cellsCapacity;
+    double *ring[3]; // FAST_RING: diagonals computed only to feed the next two, round robin
+    double *block; // FAST_BLOCK: the block the walk back last recomputed
+    int64_t blockStart, blockCellsLength, blockCellsCapacity;
+} FastForward;
+
+static FastDiagonal *fastForward_get(FastForward *f, int64_t xay) {
+    return xay >= f->base && xay < f->base + f->length ? &f->diagonals[xay - f->base] : NULL;
+}
+
+static double *fastForward_cells(FastForward *f, FastDiagonal *d) {
+    return d->where == FAST_STORED ? f->cells + d->offset : (d->where == FAST_RING ? f->ring[d->offset] : f->block + d->offset);
+}
+
+static FastDiagonal *fastForward_add(FastForward *f, Diagonal diagonal, int64_t stateNumber, bool store) {
+    assert(f->length < f->capacity); // all the buffers are sized up front, from the band
+    int64_t xay = diagonal_getXay(diagonal);
+    assert(xay == f->base + f->length);
+    FastDiagonal *d = &f->diagonals[f->length++];
+    d->xmyL = diagonal_getMinXmy(diagonal);
+    d->width = diagonal_getWidth(diagonal);
+    d->logScale = 0.0;
+    if (store) {
+        d->where = FAST_STORED;
+        d->offset = f->cellsLength;
+        f->cellsLength += d->width * stateNumber;
+        assert(f->cellsLength <= f->cellsCapacity);
+    } else {
+        d->where = FAST_RING;
+        d->offset = xay % 3;
+    }
+    return d;
+}
+
+/*
+ * Plans the chunks.  Where the tracebacks fall depends only on the band, so the chunks, and so
+ * the buffers they need, are known before any dp is done: nothing is grown as the dp goes.
+ */
+static FastChunk *fastForward_construct(FastForward *f, Band *band, int64_t diagonalNumber, int64_t stateNumber,
+                                        PairwiseAlignmentParameters *p, int64_t *chunkNumber) {
+    int64_t chunkCapacity = 16;
+    FastChunk *chunks = st_malloc(sizeof(FastChunk) * chunkCapacity);
+    *chunkNumber = 0;
+    int64_t maxDiagonals = 1, maxCells = 1, maxBlockCells = 1, maxWidth = 1;
+    int64_t tracedBackTo = 0, previousEnd = 0;
+    for (int64_t xay = 0; xay <= diagonalNumber; xay++) {
+        int64_t width = diagonal_getWidth(band->diagonals[xay]);
+        maxWidth = width > maxWidth ? width : maxWidth;
+        bool atEnd = xay == diagonalNumber;
+        bool tracebackPoint = xay >= tracedBackTo + p->minDiagsBetweenTraceBack && width <= p->diagonalExpansion * 2 + 1;
+        if (xay == 0 || (!atEnd && !tracebackPoint)) {
+            continue;
+        }
+        FastChunk c = { previousEnd, xay, tracedBackTo, xay - (atEnd ? 0 : p->traceBackDiagonals + 1), 0 };
+        int64_t cells = 0;
+        for (int64_t d = c.tracedBackTo; d <= c.end; d++) {
+            cells += diagonal_getWidth(band->diagonals[d]);
+        }
+        if (cells * stateNumber * (int64_t) sizeof(double) > FAST_CHECKPOINT_BYTES) {
+            c.blockSize = (int64_t) sqrt((double) (c.tracedBackFrom - c.start));
+            c.blockSize = c.blockSize < 8 ? 8 : c.blockSize;
+            cells = 0;
+            int64_t blockCells = 0;
+            for (int64_t d = c.tracedBackTo; d <= c.end; d++) {
+                int64_t w = diagonal_getWidth(band->diagonals[d]);
+                cells += fastChunk_stores(&c, d) ? w : 0;
+                if (d > c.start && d < c.tracedBackFrom) {
+                    blockCells = (d - c.start - 1) % c.blockSize == 0 ? w : blockCells + w;
+                    maxBlockCells = blockCells > maxBlockCells ? blockCells : maxBlockCells;
+                }
+            }
+        }
+        maxCells = cells > maxCells ? cells : maxCells;
+        maxDiagonals = c.end - c.tracedBackTo + 1 > maxDiagonals ? c.end - c.tracedBackTo + 1 : maxDiagonals;
+        if (*chunkNumber == chunkCapacity) {
+            chunkCapacity *= 2;
+            chunks = st_realloc(chunks, sizeof(FastChunk) * chunkCapacity);
+        }
+        chunks[(*chunkNumber)++] = c;
+        tracedBackTo = c.tracedBackFrom;
+        previousEnd = xay;
+    }
+    f->capacity = maxDiagonals + 1;
+    f->diagonals = st_malloc(sizeof(FastDiagonal) * f->capacity);
+    f->cellsCapacity = maxCells * stateNumber;
+    f->cells = st_malloc(sizeof(double) * f->cellsCapacity);
+    for (int64_t i = 0; i < 3; i++) {
+        f->ring[i] = st_malloc(sizeof(double) * maxWidth * stateNumber);
+    }
+    f->blockCellsCapacity = maxBlockCells * stateNumber;
+    f->block = st_malloc(sizeof(double) * f->blockCellsCapacity);
+    f->blockStart = -1;
+    f->blockCellsLength = 0;
+    f->base = 0;
+    f->length = 0;
+    f->cellsLength = 0;
+    return chunks;
+}
+
+static void fastForward_destruct(FastForward *f) {
+    free(f->diagonals);
+    free(f->cells);
+    for (int64_t i = 0; i < 3; i++) {
+        free(f->ring[i]);
+    }
+    free(f->block);
+}
+
+/*
+ * Drops the diagonals before xay, moving the rest -- all kept -- to the front of the buffer.
+ */
+static void fastForward_keepFrom(FastForward *f, int64_t xay) {
+    assert(xay >= f->base && xay < f->base + f->length);
+    int64_t first = xay - f->base;
+    assert(f->diagonals[first].where == FAST_STORED);
+    int64_t cellStart = f->diagonals[first].offset;
+    memmove(f->cells, f->cells + cellStart, sizeof(double) * (f->cellsLength - cellStart));
+    f->cellsLength -= cellStart;
+    memmove(f->diagonals, f->diagonals + first, sizeof(FastDiagonal) * (f->length - first));
+    f->length -= first;
+    f->base = xay;
+    for (int64_t i = 0; i < f->length; i++) {
+        assert(f->diagonals[i].where == FAST_STORED);
+        f->diagonals[i].offset -= cellStart;
+    }
+    f->blockStart = -1;
+}
+
+/*
+ * Where cell i of a diagonal finds its neighbour in another diagonal, whose xmy is the cell's
+ * plus xmyDelta: the neighbour is cell i + shift, and exists for i in [lo, hi).
+ */
+static void fastDiagonal_neighbours(FastDiagonal *cur, FastDiagonal *other, int64_t xmyDelta,
+                                    int64_t *shift, int64_t *lo, int64_t *hi) {
+    if (other == NULL) {
+        *shift = 0;
+        *lo = 0;
+        *hi = 0;
+        return;
+    }
+    assert((cur->xmyL + xmyDelta - other->xmyL) % 2 == 0);
+    *shift = (cur->xmyL + xmyDelta - other->xmyL) / 2;
+    *lo = *shift < 0 ? -*shift : 0;
+    *hi = other->width - *shift < cur->width ? other->width - *shift : cur->width;
+    if (*hi < *lo) {
+        *hi = *lo;
+    }
+}
+
+/*
+ * The values of a diagonal are kept relative to a scale, exp(logScale), chosen so they neither
+ * underflow nor overflow.  Rescaling every diagonal cost a pass over it for nothing: probabilities
+ * shrink by a bounded factor per diagonal, so the scale only needs moving every few dozen.  Moves
+ * it, if the diagonal's largest value has drifted out of range, and returns the log of the factor
+ * the cells were divided by.
+ */
+#define FAST_SCALE_LOW 1e-100
+#define FAST_SCALE_HIGH 1e100
+
+static double fastDiagonal_rescale(double *restrict cells, int64_t n, double max) {
+    if (max <= 0.0 || (max >= FAST_SCALE_LOW && max <= FAST_SCALE_HIGH)) {
+        return 0.0;
+    }
+    double r = 1.0 / max;
+    for (int64_t i = 0; i < n; i++) {
+        cells[i] *= r;
+    }
+    return log(max);
+}
+
+/*
+ * out[i] = em[i] * sum_k t[k] * in[k][i] for i in [0, n), or without the em factor if em is NULL,
+ * returning the largest out[i].  One loop per number of terms, so each case vectorises and the
+ * transitions a state lacks cost nothing.  The terms are summed in order, as the separate passes
+ * this replaced did.
+ */
+#define FAST_SUM_LOOP(EXPR) \
+    _Pragma("omp simd reduction(max:max)") \
+    for (int64_t i = 0; i < n; i++) { \
+        double v = (EXPR); \
+        out[i] = v; \
+        max = v > max ? v : max; \
+    }
+
+static double fastSum(double *restrict out, const double *restrict em, const double *const *in, const double *t,
+                      int64_t terms, int64_t n) {
+    double max = 0.0;
+    const double *restrict i0 = terms > 0 ? in[0] : NULL, *restrict i1 = terms > 1 ? in[1] : NULL;
+    const double *restrict i2 = terms > 2 ? in[2] : NULL, *restrict i3 = terms > 3 ? in[3] : NULL;
+    const double *restrict i4 = terms > 4 ? in[4] : NULL;
+    double t0 = terms > 0 ? t[0] : 0, t1 = terms > 1 ? t[1] : 0, t2 = terms > 2 ? t[2] : 0;
+    double t3 = terms > 3 ? t[3] : 0, t4 = terms > 4 ? t[4] : 0;
+    if (em != NULL) {
+        switch (terms) {
+            case 0: FAST_SUM_LOOP(0.0); break;
+            case 1: FAST_SUM_LOOP(em[i] * (t0 * i0[i])); break;
+            case 2: FAST_SUM_LOOP(em[i] * (t0 * i0[i] + t1 * i1[i])); break;
+            case 3: FAST_SUM_LOOP(em[i] * (t0 * i0[i] + t1 * i1[i] + t2 * i2[i])); break;
+            case 4: FAST_SUM_LOOP(em[i] * (t0 * i0[i] + t1 * i1[i] + t2 * i2[i] + t3 * i3[i])); break;
+            default: FAST_SUM_LOOP(em[i] * (t0 * i0[i] + t1 * i1[i] + t2 * i2[i] + t3 * i3[i] + t4 * i4[i]));
+        }
+    } else {
+        switch (terms) {
+            case 0: FAST_SUM_LOOP(0.0); break;
+            case 1: FAST_SUM_LOOP(t0 * i0[i]); break;
+            case 2: FAST_SUM_LOOP(t0 * i0[i] + t1 * i1[i]); break;
+            case 3: FAST_SUM_LOOP(t0 * i0[i] + t1 * i1[i] + t2 * i2[i]); break;
+            case 4: FAST_SUM_LOOP(t0 * i0[i] + t1 * i1[i] + t2 * i2[i] + t3 * i3[i]); break;
+            default: FAST_SUM_LOOP(t0 * i0[i] + t1 * i1[i] + t2 * i2[i] + t3 * i3[i] + t4 * i4[i]);
+        }
+    }
+    return max;
+}
+
+static void fastZero(double *restrict out, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        out[i] = 0.0;
+    }
+}
+
+/*
+ * The two sequences as bytes, with Y reversed, so that walking along a diagonal -- x up, y
+ * down -- reads both forwards, and the emission lookups below vectorise.
+ */
+typedef struct _fastSymbols {
+    uint8_t *x, *yReversed;
+    int64_t lX, lY;
+} FastSymbols;
+
+static FastSymbols fastSymbols_construct(const SymbolString sX, const SymbolString sY) {
+    FastSymbols f;
+    f.lX = sX.length;
+    f.lY = sY.length;
+    f.x = st_malloc(sX.length + 1);
+    f.yReversed = st_malloc(sY.length + 1);
+    for (int64_t i = 0; i < sX.length; i++) {
+        f.x[i] = (uint8_t) sX.sequence[i];
+    }
+    for (int64_t i = 0; i < sY.length; i++) {
+        f.yReversed[i] = (uint8_t) sY.sequence[sY.length - 1 - i];
+    }
+    return f;
+}
+
+static void fastSymbols_destruct(FastSymbols f) {
+    free(f.x);
+    free(f.yReversed);
+}
+
+/*
+ * The emission of cells [lo, hi) of a diagonal into a state of the given type, into em[lo, hi).
+ * x0/y0 are the coordinates of cell 0, and cell i is at (x0 + i, y0 - i).  For the forward
+ * recursion a cell emits its own symbols (the ones before it, at x-1 and y-1); for the backward
+ * it is the successor's (at x and y) -- pass x0 and y0 one larger in that case.
+ */
+static void fastDiagonal_emissions(PairHmm *hmm, int64_t type, FastSymbols *symbols,
+                                   int64_t x0, int64_t y0, int64_t lo, int64_t hi, double scale, double *restrict em) {
+    double *restrict e = em + lo;
+    int64_t n = hi - lo, i = 0;
+    // Only the sequences the type emits are read: at the edge of the matrix the other one's index
+    // is off its end.  cX[i] is X[x0 - 1 + lo + i] and cY[i] is Y[y0 - 1 - lo - i].
+    const uint8_t *restrict cX = type != PAIR_HMM_GAP_Y ? symbols->x + (x0 - 1 + lo) : NULL;
+    const uint8_t *restrict cY = type != PAIR_HMM_GAP_X ? symbols->yReversed + (symbols->lY - y0 + lo) : NULL;
+#if defined(__AVX2__)
+    // Table lookups the compiler will not vectorise on its own
+    __m256d vScale = _mm256_set1_pd(scale);
+    __m128i vSymbols = _mm_set1_epi32(SYMBOL_NUMBER);
+    for (; i + 4 <= n; i += 4) {
+        int32_t bytes;
+        __m256d v;
+        if (type == PAIR_HMM_GAP_X) {
+            memcpy(&bytes, cX + i, sizeof(int32_t));
+            v = _mm256_i32gather_pd(hmm->eGapX, _mm_cvtepu8_epi32(_mm_cvtsi32_si128(bytes)), 8);
+        } else if (type == PAIR_HMM_GAP_Y) {
+            memcpy(&bytes, cY + i, sizeof(int32_t));
+            v = _mm256_i32gather_pd(hmm->eGapY, _mm_cvtepu8_epi32(_mm_cvtsi32_si128(bytes)), 8);
+        } else {
+            memcpy(&bytes, cX + i, sizeof(int32_t));
+            __m128i vx = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(bytes));
+            memcpy(&bytes, cY + i, sizeof(int32_t));
+            __m128i vy = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(bytes));
+            v = _mm256_mul_pd(_mm256_i32gather_pd(hmm->eMatch, _mm_add_epi32(_mm_mullo_epi32(vx, vSymbols), vy), 8), vScale);
+        }
+        _mm256_storeu_pd(e + i, v);
+    }
+#endif
+    if (type == PAIR_HMM_GAP_X) {
+        for (; i < n; i++) {
+            e[i] = hmm->eGapX[cX[i]];
+        }
+    } else if (type == PAIR_HMM_GAP_Y) {
+        for (; i < n; i++) {
+            e[i] = hmm->eGapY[cY[i]];
+        }
+    } else {
+        for (; i < n; i++) {
+            e[i] = hmm->eMatch[cX[i] * SYMBOL_NUMBER + cY[i]] * scale;
+        }
+    }
+}
+
+/*
+ * Forward values for diagonal cur, from the diagonals one (m1) and two (m2) before it.
+ */
+static void fastForwardDiagonal(PairHmm *hmm, int64_t xay, FastDiagonal *cur, double *restrict curCells,
+                                FastDiagonal *m1, const double *m1Cells, FastDiagonal *m2, const double *m2Cells,
+                                FastSymbols *symbols, double *restrict em) {
+    int64_t w = cur->width;
+    int64_t x0 = (xay + cur->xmyL) / 2, y0 = (xay - cur->xmyL) / 2;
+    // Matches read from two diagonals back, whose scale can differ from the previous diagonal's,
+    // which this one's is taken relative to.  Fold the difference into the match emissions.
+    double matchScale = m2 != NULL ? (m2->logScale == m1->logScale ? 1.0 : exp(m2->logScale - m1->logScale)) : 0.0;
+    double max = 0.0;
+    for (int64_t type = 0; type < 3; type++) {
+        FastDiagonal *src = type == PAIR_HMM_MATCH ? m2 : m1;
+        const double *srcCells = type == PAIR_HMM_MATCH ? m2Cells : m1Cells;
+        int64_t shift, lo, hi;
+        fastDiagonal_neighbours(cur, src, type == PAIR_HMM_GAP_X ? -1 : (type == PAIR_HMM_GAP_Y ? 1 : 0), &shift, &lo, &hi);
+        if (hi > lo) {
+            fastDiagonal_emissions(hmm, type, symbols, x0, y0, lo, hi, matchScale, em);
+        }
+        for (int64_t s = 0; s < hmm->stateNumber; s++) {
+            if (hmm->type[s] != type) {
+                continue;
+            }
+            double *restrict out = curCells + s * w;
+            fastZero(out, lo);
+            fastZero(out + hi, w - hi);
+            if (hi > lo) {
+                const double *in[PAIR_HMM_MAX_STATES];
+                for (int64_t k = 0; k < hmm->into[s].number; k++) {
+                    in[k] = srcCells + hmm->into[s].state[k] * src->width + shift + lo;
+                }
+                double m = fastSum(out + lo, em + lo, in, hmm->into[s].t, hmm->into[s].number, hi - lo);
+                max = m > max ? m : max;
+            }
+        }
+    }
+    cur->logScale = m1->logScale + fastDiagonal_rescale(curCells, w * hmm->stateNumber, max);
+}
+
+/*
+ * Backward values for diagonal cur, from the diagonals one (p1) and two (p2) after it.  w is
+ * scratch for stateNumber * width values.
+ */
+static void fastBackwardDiagonal(PairHmm *hmm, int64_t xay, FastDiagonal *cur, double *restrict curCells,
+                                 FastDiagonal *p1, const double *p1Cells, FastDiagonal *p2, const double *p2Cells,
+                                 FastSymbols *symbols, double *restrict w, double *restrict em) {
+    int64_t width = cur->width;
+    int64_t x0 = (xay + cur->xmyL) / 2, y0 = (xay - cur->xmyL) / 2;
+    double matchScale = p2 != NULL ? (p2->logScale == p1->logScale ? 1.0 : exp(p2->logScale - p1->logScale)) : 0.0;
+    // w[s] = what entering state s from this cell is worth: the successor's emission and backward value
+    for (int64_t type = 0; type < 3; type++) {
+        FastDiagonal *succ = type == PAIR_HMM_MATCH ? p2 : p1;
+        const double *succCells = type == PAIR_HMM_MATCH ? p2Cells : p1Cells;
+        int64_t shift, lo, hi;
+        fastDiagonal_neighbours(cur, succ, type == PAIR_HMM_GAP_X ? 1 : (type == PAIR_HMM_GAP_Y ? -1 : 0), &shift, &lo, &hi);
+        if (hi > lo) {
+            fastDiagonal_emissions(hmm, type, symbols, x0 + 1, y0 + 1, lo, hi, matchScale, em);
+        }
+        for (int64_t s = 0; s < hmm->stateNumber; s++) {
+            if (hmm->type[s] != type) {
+                continue;
+            }
+            double *restrict ws = w + s * width;
+            fastZero(ws, lo);
+            fastZero(ws + hi, width - hi);
+            if (hi > lo) {
+                const double *restrict in = succCells + s * succ->width + shift + lo;
+                double *restrict out = ws + lo;
+                const double *restrict e = em + lo;
+                for (int64_t i = 0; i < hi - lo; i++) {
+                    out[i] = e[i] * in[i];
+                }
+            }
+        }
+    }
+    double max = 0.0;
+    for (int64_t f = 0; f < hmm->stateNumber; f++) {
+        const double *in[PAIR_HMM_MAX_STATES];
+        for (int64_t k = 0; k < hmm->outOf[f].number; k++) {
+            in[k] = w + hmm->outOf[f].state[k] * width;
+        }
+        double m = fastSum(curCells + f * width, NULL, in, hmm->outOf[f].t, hmm->outOf[f].number, width);
+        max = m > max ? m : max;
+    }
+    cur->logScale = p1->logScale + fastDiagonal_rescale(curCells, width * hmm->stateNumber, max);
+}
+
+/*
+ * Posteriors of the states the caller wants lists for, over one diagonal.
+ */
+static void fastPosteriors(StateMachine *sM, int64_t xay, FastDiagonal *fd, const double *fCells,
+                           FastDiagonal *bd, const double *bCells, double logTotal, PairwiseAlignmentParameters *p,
+                           stList *alignedPairs, stList *gapXPairs, stList *gapYPairs) {
+    assert(fd->xmyL == bd->xmyL && fd->width == bd->width);
+    int64_t w = fd->width;
+    int64_t x0 = (xay + fd->xmyL) / 2, y0 = (xay - fd->xmyL) / 2;
+    double logNorm = fd->logScale + bd->logScale - logTotal;
+    bool direct = logNorm < 700.0; // else exp(logNorm) would overflow, and it is done cell by cell in log space
+    double norm = direct ? exp(logNorm) : 0.0;
+    // Most cells fall short of the threshold, so test them against it in their own scale -- one
+    // multiply and one compare -- a hair low, so addPosteriorProb makes the exact decision.
+    double fbThreshold = direct ? p->threshold * exp(-logNorm) * (1.0 - 1e-9) : 0.0;
+    bool everyCell = p->threshold <= 0.0; // then the log space path reports every cell, zeros included
+    int64_t states[3] = { sM->matchState, sM->gapXState, sM->gapYState };
+    stList *lists[3] = { alignedPairs, gapXPairs, gapYPairs };
+    for (int64_t k = 0; k < 3; k++) {
+        if (lists[k] == NULL) {
+            continue;
+        }
+        // Matches and gaps in y need x > 0, i.e. i >= 1 - x0; matches and gaps in x need y > 0, i.e. i < y0
+        int64_t lo = k != 2 && 1 - x0 > 0 ? 1 - x0 : 0;
+        int64_t hi = k != 1 && y0 < w ? y0 : w;
+        const double *f = fCells + states[k] * w, *b = bCells + states[k] * w;
+        for (int64_t i = lo; i < hi; i++) {
+            double fb = f[i] * b[i];
+            if (everyCell || (fb >= fbThreshold && fb > 0.0)) {
+                addPosteriorProb(x0 + i, y0 - i, direct ? fb * norm : (fb > 0.0 ? exp(log(fb) + logNorm) : 0.0), lists[k], p);
+            }
+        }
+    }
+}
+
+/*
+ * The fast equivalent of getPosteriorProbsWithBanding with diagonalCalculationPosteriorMatchProbs
+ * (gapXPairs and gapYPairs NULL) or diagonalCalculationPosteriorProbs.  Returns false, having done
+ * nothing, if the state machine is not one it can use.
+ */
+/*
+ * The machine's flattened form, made the first time it is asked for and kept on the machine:
+ * flattening runs the cell calculation for every pair of symbols and takes hundreds of exps, which
+ * cost more than the dp itself for the thousands of few-base alignments a bar run makes.  Threads
+ * share machines, so a thread that loses the race to store its copy frees it and uses the winner's.
+ */
+static PairHmm *pairHmm_get(StateMachine *sM) {
+    PairHmm *hmm = __atomic_load_n((PairHmm **) &sM->flat, __ATOMIC_ACQUIRE);
+    if (hmm == NULL) {
+        PairHmm *made = st_malloc(sizeof(PairHmm));
+        pairHmm_construct(made, sM);
+        PairHmm *expected = NULL;
+        if (__atomic_compare_exchange_n((PairHmm **) &sM->flat, &expected, made, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            hmm = made;
+        } else {
+            free(made);
+            hmm = expected;
+        }
+    }
+    return hmm;
+}
+
+static bool getPosteriorProbsWithBandingFast(StateMachine *sM, stList *anchorPairs, const SymbolString sX, const SymbolString sY,
+                                             PairwiseAlignmentParameters *p, bool alignmentHasRaggedLeftEnd, bool alignmentHasRaggedRightEnd,
+                                             stList *alignedPairs, stList *gapXPairs, stList *gapYPairs) {
+    PairHmm hmm = *pairHmm_get(sM);
+    if (!hmm.ok) {
+        return 0;
+    }
+    int64_t diagonalNumber = sX.length + sY.length;
+    if (diagonalNumber == 0) {
+        return 1;
+    }
+    int64_t ns = hmm.stateNumber;
+
+#if defined(__SSE2__)
+    // Cells far off the alignment decay towards zero; flush them rather than crawl through denormals
+    unsigned int oldCsr = _mm_getcsr();
+    _mm_setcsr(oldCsr | 0x8040); // flush-to-zero and denormals-are-zero
+#endif
+
+    Band *band = p->dynamicAnchorExpansion ? band_constructDynamic(anchorPairs, sX.length, sY.length) :
+                 band_construct(anchorPairs, sX.length, sY.length, p->diagonalExpansion);
+    FastForward fwd;
+    int64_t chunkNumber;
+    FastChunk *chunks = fastForward_construct(&fwd, band, diagonalNumber, ns, p, &chunkNumber);
+    FastSymbols symbols = fastSymbols_construct(sX, sY);
+
+    // scratch, sized to the widest diagonal
+    int64_t maxWidth = 1;
+    for (int64_t d = 0; d <= diagonalNumber; d++) {
+        int64_t w = diagonal_getWidth(band->diagonals[d]);
+        maxWidth = w > maxWidth ? w : maxWidth;
+    }
+    double *em = st_malloc(sizeof(double) * maxWidth);
+    double *scratch = st_malloc(sizeof(double) * maxWidth * ns);
+    FastDiagonal back[3]; // the backward diagonals xay, xay + 1 and xay + 2, round robin
+    double *backCells[3];
+    for (int64_t i = 0; i < 3; i++) {
+        backCells[i] = st_malloc(sizeof(double) * maxWidth * ns);
+    }
+
+    FastDiagonal *d0 = fastForward_add(&fwd, band->diagonals[0], ns, 1);
+    for (int64_t s = 0; s < ns; s++) {
+        double v = alignmentHasRaggedLeftEnd ? hmm.raggedStart[s] : hmm.start[s];
+        for (int64_t i = 0; i < d0->width; i++) {
+            fwd.cells[d0->offset + s * d0->width + i] = v;
+        }
+    }
+
+    for (int64_t c = 0; c < chunkNumber; c++) {
+        FastChunk *chunk = &chunks[c];
+        for (int64_t xay = chunk->start + 1; xay <= chunk->end; xay++) {
+            FastDiagonal *cur = fastForward_add(&fwd, band->diagonals[xay], ns, fastChunk_stores(chunk, xay));
+            FastDiagonal *m1 = fastForward_get(&fwd, xay - 1), *m2 = fastForward_get(&fwd, xay - 2);
+            fastForwardDiagonal(&hmm, xay, cur, fastForward_cells(&fwd, cur), m1, fastForward_cells(&fwd, m1),
+                                m2, m2 != NULL ? fastForward_cells(&fwd, m2) : NULL, &symbols, em);
+        }
+
+        // Treat every cell of the chunk's last diagonal as an end point, and walk back to where the
+        // last traceback stopped.  Posteriors are taken only up to traceBackDiagonals before the
+        // end, where that pretence has worn off; the rest are redone by the next traceback.
+        bool atEnd = chunk->end == diagonalNumber;
+        const double *endProbs = atEnd && alignmentHasRaggedRightEnd ? hmm.raggedEnd : hmm.end;
+        FastDiagonal *last = fastForward_get(&fwd, chunk->end);
+        const double *lastCells = fastForward_cells(&fwd, last);
+        double total = 0.0;
+        for (int64_t s = 0; s < ns; s++) {
+            for (int64_t i = 0; i < last->width; i++) {
+                total += lastCells[s * last->width + i] * endProbs[s];
+            }
+        }
+        double logTotal = last->logScale + log(total);
+        bool havePosteriors = total > 0.0;
+
+        for (int64_t xay2 = chunk->end; xay2 > chunk->tracedBackTo; xay2--) {
+            FastDiagonal *b = &back[xay2 % 3];
+            double *bCells = backCells[xay2 % 3];
+            FastDiagonal *f = fastForward_get(&fwd, xay2);
+            b->xmyL = f->xmyL;
+            b->width = f->width;
+            if (xay2 == chunk->end) {
+                for (int64_t s = 0; s < ns; s++) {
+                    for (int64_t i = 0; i < b->width; i++) {
+                        bCells[s * b->width + i] = endProbs[s];
+                    }
+                }
+                b->logScale = 0.0;
+            } else {
+                FastDiagonal *p1 = &back[(xay2 + 1) % 3], *p2 = xay2 + 2 <= chunk->end ? &back[(xay2 + 2) % 3] : NULL;
+                fastBackwardDiagonal(&hmm, xay2, b, bCells, p1, backCells[(xay2 + 1) % 3],
+                                     p2, p2 != NULL ? backCells[(xay2 + 2) % 3] : NULL, &symbols, scratch, em);
+            }
+            if (xay2 > chunk->tracedBackFrom || !havePosteriors) {
+                continue;
+            }
+            if (f->where != FAST_STORED && !(f->where == FAST_BLOCK && xay2 >= fwd.blockStart)) {
+                // Recompute the block this diagonal is in, from the kept pair before it.  The same
+                // code on the same inputs, so the same values, scales and all, as the first time.
+                int64_t blockStart = chunk->start + 1 + (xay2 - chunk->start - 1) / chunk->blockSize * chunk->blockSize;
+                fwd.blockStart = blockStart;
+                fwd.blockCellsLength = 0;
+                for (int64_t xay3 = blockStart; xay3 <= xay2; xay3++) {
+                    FastDiagonal *cur = fastForward_get(&fwd, xay3);
+                    cur->where = FAST_BLOCK;
+                    cur->offset = fwd.blockCellsLength;
+                    fwd.blockCellsLength += cur->width * ns;
+                    assert(fwd.blockCellsLength <= fwd.blockCellsCapacity);
+                    FastDiagonal *m1 = fastForward_get(&fwd, xay3 - 1), *m2 = fastForward_get(&fwd, xay3 - 2);
+                    fastForwardDiagonal(&hmm, xay3, cur, fastForward_cells(&fwd, cur), m1, fastForward_cells(&fwd, m1),
+                                        m2, m2 != NULL ? fastForward_cells(&fwd, m2) : NULL, &symbols, em);
+                }
+            }
+            fastPosteriors(sM, xay2, f, fastForward_cells(&fwd, f), b, bCells, logTotal, p, alignedPairs, gapXPairs, gapYPairs);
+        }
+        if (!atEnd) {
+            fastForward_keepFrom(&fwd, chunk->tracedBackFrom);
+        }
+    }
+
+    free(chunks);
+    fastForward_destruct(&fwd);
+    fastSymbols_destruct(symbols);
+    free(em);
+    free(scratch);
+    for (int64_t i = 0; i < 3; i++) {
+        free(backCells[i]);
+    }
+    band_destruct(band);
+#if defined(__SSE2__)
+    _mm_setcsr(oldCsr);
+#endif
+    return 1;
+}
+
+///////////////////////////////////
+///////////////////////////////////
 //Banded alignment routine to calculate posterior match probs
 //
 //
@@ -776,6 +1563,18 @@ void getPosteriorProbsWithBanding(StateMachine *sM, stList *anchorPairs, const S
 
     int64_t diagonalNumber = sX.length + sY.length;
     if (diagonalNumber == 0) { //Deal with trivial case
+        return;
+    }
+
+    //The posterior probabilities have a fast path.  The expectations for EM training do not.
+    if (diagonalPosteriorProbFn == diagonalCalculationPosteriorMatchProbs &&
+        getPosteriorProbsWithBandingFast(sM, anchorPairs, sX, sY, p, alignmentHasRaggedLeftEnd, alignmentHasRaggedRightEnd,
+                                         ((void **) extraArgs)[0], NULL, NULL)) {
+        return;
+    }
+    if (diagonalPosteriorProbFn == diagonalCalculationPosteriorProbs &&
+        getPosteriorProbsWithBandingFast(sM, anchorPairs, sX, sY, p, alignmentHasRaggedLeftEnd, alignmentHasRaggedRightEnd,
+                                         ((void **) extraArgs)[0], ((void **) extraArgs)[2], ((void **) extraArgs)[4])) {
         return;
     }
 
@@ -1224,6 +2023,9 @@ stList *getAnchorPairsForPairwiseAlignmentParameters(const char *sX, const char 
     if ((int64_t) lX * lY <= p->anchorMatrixBiggerThanThis) {
         return stList_construct();
     }
+    if (p->anchorMethod == PAIRWISE_ANCHOR_SEED) {
+        return getSeedAnchors(sX, sY, lX, lY, p);
+    }
     if(p->useMumAnchors) {
         return getAlignedMums(sX, sY, lX, lY, p, 0, 0);
     }
@@ -1386,6 +2188,11 @@ PairwiseAlignmentParameters *pairwiseAlignmentBandingParameters_construct() {
     p->recursiveMums = 1;
     p->k = 50;
     p->u = 1;
+    p->anchorMethod = PAIRWISE_ANCHOR_LEGACY;
+    p->seedHspThreshold = 2000;
+    p->seedHspThresholdMin = 1000;
+    p->seedRecursionDepth = 2;
+    p->seedXDrop = 910;
 
     return p;
 }
@@ -1441,6 +2248,21 @@ PairwiseAlignmentParameters *pairwiseAlignmentParameters_jsonParse(char *buf, si
         }
         else if (strcmp(keyString, "dynamicAnchorExpansion") == 0) {
             params->dynamicAnchorExpansion = stJson_parseBool(js, tokens, ++tokenIndex);
+        }
+        else if (strcmp(keyString, "anchorMethod") == 0) {
+            params->anchorMethod = stJson_parseInt(js, tokens, ++tokenIndex);
+        }
+        else if (strcmp(keyString, "seedHspThreshold") == 0) {
+            params->seedHspThreshold = stJson_parseInt(js, tokens, ++tokenIndex);
+        }
+        else if (strcmp(keyString, "seedHspThresholdMin") == 0) {
+            params->seedHspThresholdMin = stJson_parseInt(js, tokens, ++tokenIndex);
+        }
+        else if (strcmp(keyString, "seedRecursionDepth") == 0) {
+            params->seedRecursionDepth = stJson_parseInt(js, tokens, ++tokenIndex);
+        }
+        else if (strcmp(keyString, "seedXDrop") == 0) {
+            params->seedXDrop = stJson_parseInt(js, tokens, ++tokenIndex);
         }
         else {
             st_errAbort("ERROR: Unrecognised key in pairwise alignment parameters json: %s\n", keyString);
@@ -1948,13 +2770,15 @@ static Mum *mum_construct(int64_t x, int64_t y, int64_t length) {
 }
 
 void mum_destruct(Mum *mum) {
-    assert(mum->refCount > 0);
-    mum->refCount--;
-    if(mum->refCount == 0) {
-        if(mum->pMum != NULL) {
-            mum_destruct(mum->pMum);
+    // A loop, not recursion: a chain of mums along a megabase is tens of thousands long
+    while (mum != NULL) {
+        assert(mum->refCount > 0);
+        if (--mum->refCount > 0) {
+            return;
         }
+        Mum *pMum = mum->pMum;
         free(mum);
+        mum = pMum;
     }
 }
 
@@ -2121,3 +2945,382 @@ stList *getAlignedMums(const char *sX, const char *sY, int64_t lX, int64_t lY, P
 }
 
 
+///////////////////////////////////
+///////////////////////////////////
+//Anchoring by spaced seeds, ungapped extension and chaining
+//
+//What the lastz call above does -- 12of19 spaced seeds allowing one transition, HOXD70 scored
+//ungapped extension, and the heaviest colinear chain of the resulting HSPs -- but in process.
+//lastz costs a process, two temporary files and ~50 ms of startup for every pairwise alignment
+//it anchors.  The MUM anchors, which were the way around that, accept "unique" matches as short
+//as a dozen bases, and at the divergence of a deep branch most of those are random: simulated
+//at 0.3 substitutions per site per branch, half the MUM anchors were off the true alignment,
+//and the banded dp, which cannot leave the band they define, followed them.
+///////////////////////////////////
+///////////////////////////////////
+
+#define SEED_SPAN 19
+#define SEED_WEIGHT 12
+#define SEED_MAX_WORD_COUNT 64 // Y positions a seed word may have before it is taken to be a repeat and skipped
+
+static const int64_t seedCare[SEED_WEIGHT] = { 0, 1, 2, 4, 7, 8, 11, 13, 15, 16, 17, 18 }; // 1110100110010101111
+
+static const int64_t seedHoxd70[5][5] = { // A C G T, then N against anything
+        {   91, -114,  -31, -123, -100 },
+        { -114,  100, -125,  -31, -100 },
+        {  -31, -125,  100, -114, -100 },
+        { -123,  -31, -114,   91, -100 },
+        { -100, -100, -100, -100, -100 } };
+
+typedef struct _seedSequence {
+    uint8_t *codes; // 0-3 for ACGT, 4 for anything else
+    int32_t *masked; // masked[i] is the number of lower case bases before i
+} SeedSequence;
+
+static SeedSequence seedSequence_construct(const char *s, int64_t l) {
+    SeedSequence seq;
+    seq.codes = st_malloc(l + 1);
+    seq.masked = st_malloc(sizeof(int32_t) * (l + 1));
+    seq.masked[0] = 0;
+    for (int64_t i = 0; i < l; i++) {
+        switch (s[i]) {
+            case 'A': case 'a': seq.codes[i] = 0; break;
+            case 'C': case 'c': seq.codes[i] = 1; break;
+            case 'G': case 'g': seq.codes[i] = 2; break;
+            case 'T': case 't': seq.codes[i] = 3; break;
+            default: seq.codes[i] = 4;
+        }
+        seq.masked[i + 1] = seq.masked[i] + (islower((unsigned char) s[i]) ? 1 : 0);
+    }
+    return seq;
+}
+
+static void seedSequence_destruct(SeedSequence seq) {
+    free(seq.codes);
+    free(seq.masked);
+}
+
+/*
+ * The seed word at i, over the seed's care positions.  False if the span has an N, or, when
+ * repeat masking, a lower case base.
+ */
+static inline bool seed_word(const SeedSequence *seq, int64_t i, bool repeatMask, uint32_t *word) {
+    if (repeatMask && seq->masked[i + SEED_SPAN] != seq->masked[i]) {
+        return 0;
+    }
+    uint32_t w = 0;
+    for (int64_t j = 0; j < SEED_WEIGHT; j++) {
+        uint8_t c = seq->codes[i + seedCare[j]];
+        if (c > 3) {
+            return 0;
+        }
+        w |= ((uint32_t) c) << (2 * j);
+    }
+    *word = w;
+    return 1;
+}
+
+typedef struct _seedEntry {
+    uint32_t word;
+    int32_t pos;
+} SeedEntry;
+
+static int seedEntry_cmp(const void *a, const void *b) {
+    const SeedEntry *e = a, *f = b;
+    if (e->word != f->word) {
+        return e->word < f->word ? -1 : 1;
+    }
+    return e->pos < f->pos ? -1 : (e->pos > f->pos ? 1 : 0);
+}
+
+typedef struct _seedHsp {
+    int64_t x, y, length, score;
+} SeedHsp;
+
+/*
+ * Extends a seed hit at (x, y) both ways along its diagonal, stopping each way once the score
+ * falls xDrop below the best seen, and returns the best scoring segment.
+ */
+static SeedHsp seed_extend(const uint8_t *cX, int64_t x0, int64_t x1, const uint8_t *cY, int64_t y0, int64_t y1,
+                           int64_t x, int64_t y, int64_t xDrop) {
+    int64_t s = 0, best = 0, right = 0;
+    for (int64_t k = 0; x + k < x1 && y + k < y1; k++) {
+        s += seedHoxd70[cX[x + k]][cY[y + k]];
+        if (s > best) {
+            best = s;
+            right = k + 1;
+        } else if (s < best - xDrop) {
+            break;
+        }
+    }
+    int64_t s2 = 0, best2 = 0, left = 0;
+    for (int64_t k = 1; x - k >= x0 && y - k >= y0; k++) {
+        s2 += seedHoxd70[cX[x - k]][cY[y - k]];
+        if (s2 > best2) {
+            best2 = s2;
+            left = k;
+        } else if (s2 < best2 - xDrop) {
+            break;
+        }
+    }
+    SeedHsp hsp = { x - left, y - left, left + right, best + best2 };
+    return hsp;
+}
+
+/*
+ * The HSPs scoring at least threshold between X[x0, x1) and Y[y0, y1).
+ */
+static SeedHsp *seed_getHsps(SeedSequence *sX, int64_t x0, int64_t x1, SeedSequence *sY, int64_t y0, int64_t y1,
+                             bool repeatMask, int64_t threshold, int64_t xDrop, int64_t *hspNumber) {
+    *hspNumber = 0;
+    int64_t lX = x1 - x0, lY = y1 - y0;
+    if (lX < SEED_SPAN || lY < SEED_SPAN) {
+        return NULL;
+    }
+    // Index the words of Y, sorted, with a table of where each bucket of leading word bits starts
+    SeedEntry *entries = st_malloc(sizeof(SeedEntry) * (lY - SEED_SPAN + 1));
+    int64_t entryNumber = 0;
+    for (int64_t y = y0; y <= y1 - SEED_SPAN; y++) {
+        uint32_t w;
+        if (seed_word(sY, y, repeatMask, &w)) {
+            entries[entryNumber].word = w;
+            entries[entryNumber++].pos = (int32_t) y;
+        }
+    }
+    qsort(entries, entryNumber, sizeof(SeedEntry), seedEntry_cmp);
+    int64_t bucketBits = 4;
+    while (bucketBits < 20 && ((int64_t) 1 << bucketBits) < entryNumber) {
+        bucketBits++;
+    }
+    int64_t shift = 2 * SEED_WEIGHT - bucketBits;
+    int64_t *bucketStart = st_malloc(sizeof(int64_t) * (((int64_t) 1 << bucketBits) + 1));
+    for (int64_t b = 0, e = 0; b <= ((int64_t) 1 << bucketBits); b++) {
+        while (e < entryNumber && (int64_t) (entries[e].word >> shift) < b) {
+            e++;
+        }
+        bucketStart[b] = e;
+    }
+
+    // Walk X, looking up each word and the words one transition away from it.  A hit on a
+    // diagonal already extended past it is part of an HSP that has been found.
+    int32_t *diagonalEnd = st_malloc(sizeof(int32_t) * (lX + lY));
+    for (int64_t i = 0; i < lX + lY; i++) {
+        diagonalEnd[i] = INT32_MIN;
+    }
+    int64_t hspCapacity = 64;
+    SeedHsp *hsps = st_malloc(sizeof(SeedHsp) * hspCapacity);
+    for (int64_t x = x0; x <= x1 - SEED_SPAN; x++) {
+        uint32_t w;
+        if (!seed_word(sX, x, repeatMask, &w)) {
+            continue;
+        }
+        for (int64_t v = 0; v <= SEED_WEIGHT; v++) {
+            uint32_t w2 = v == 0 ? w : w ^ (2u << (2 * (v - 1))); // A<->G and C<->T are the same bit flip
+            int64_t b = w2 >> shift, lo = bucketStart[b], hi = bucketStart[b + 1];
+            while (lo < hi && entries[lo].word < w2) {
+                lo++;
+            }
+            int64_t e = lo;
+            while (e < hi && entries[e].word == w2) {
+                e++;
+            }
+            if (e - lo > SEED_MAX_WORD_COUNT) {
+                continue;
+            }
+            for (int64_t k = lo; k < e; k++) {
+                int64_t y = entries[k].pos;
+                int64_t d = (x - x0) - (y - y0) + lY - 1;
+                if (diagonalEnd[d] > x) {
+                    continue;
+                }
+                SeedHsp hsp = seed_extend(sX->codes, x0, x1, sY->codes, y0, y1, x, y, xDrop);
+                diagonalEnd[d] = hsp.x + hsp.length > x + 1 ? (int32_t) (hsp.x + hsp.length) : (int32_t) (x + 1);
+                if (hsp.length > 0 && hsp.score >= threshold) { // a zero-length "HSP", possible only with a threshold of 0, would break the chain's sweep
+                    if (*hspNumber == hspCapacity) {
+                        hspCapacity *= 2;
+                        hsps = st_realloc(hsps, sizeof(SeedHsp) * hspCapacity);
+                    }
+                    hsps[(*hspNumber)++] = hsp;
+                }
+            }
+        }
+    }
+    free(entries);
+    free(bucketStart);
+    free(diagonalEnd);
+    return hsps;
+}
+
+static int seedHsp_cmpByX(const void *a, const void *b) {
+    const SeedHsp *h = a, *i = b;
+    if (h->x != i->x) {
+        return h->x < i->x ? -1 : 1;
+    }
+    return h->y < i->y ? -1 : (h->y > i->y ? 1 : 0);
+}
+
+static int seed_cmpInt64(const void *a, const void *b) {
+    int64_t k = *(int64_t *) a, l = *(int64_t *) b;
+    return k < l ? -1 : (k > l ? 1 : 0);
+}
+
+/*
+ * Replaces hsps with the heaviest chain of them that is colinear and non-overlapping in both
+ * sequences, in order.  A sweep along X, with a Fenwick tree of the best chain ending at or
+ * before each Y position.
+ */
+static void seed_chain(SeedHsp *hsps, int64_t *hspNumber) {
+    int64_t n = *hspNumber;
+    if (n <= 1) {
+        return;
+    }
+    qsort(hsps, n, sizeof(SeedHsp), seedHsp_cmpByX);
+    int64_t *ends = st_malloc(sizeof(int64_t) * n), *byEnd = st_malloc(sizeof(int64_t) * n);
+    int64_t *yEnds = st_malloc(sizeof(int64_t) * n);
+    for (int64_t i = 0; i < n; i++) {
+        ends[i] = hsps[i].x + hsps[i].length;
+        byEnd[i] = i;
+        yEnds[i] = hsps[i].y + hsps[i].length;
+    }
+    // The HSPs in order of where they end in X, by sorting (end, index) pairs
+    int64_t *pairs = st_malloc(sizeof(int64_t) * 2 * n);
+    for (int64_t i = 0; i < n; i++) {
+        pairs[2 * i] = ends[i];
+        pairs[2 * i + 1] = i;
+    }
+    qsort(pairs, n, 2 * sizeof(int64_t), seed_cmpInt64); // compares the end, the first of each pair
+    for (int64_t i = 0; i < n; i++) {
+        byEnd[i] = pairs[2 * i + 1];
+    }
+    free(pairs);
+    qsort(yEnds, n, sizeof(int64_t), seed_cmpInt64);
+    int64_t m = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (m == 0 || yEnds[m - 1] != yEnds[i]) {
+            yEnds[m++] = yEnds[i];
+        }
+    }
+    int64_t *fenwickScore = st_calloc(m + 1, sizeof(int64_t)), *fenwickIndex = st_malloc(sizeof(int64_t) * (m + 1));
+    int64_t *best = st_malloc(sizeof(int64_t) * n), *prev = st_malloc(sizeof(int64_t) * n);
+    int64_t e = 0, bestEnd = -1;
+    for (int64_t i = 0; i < n; i++) {
+        // Make the chains ending at or before this HSP's start in X available
+        while (e < n && ends[byEnd[e]] <= hsps[i].x) {
+            int64_t j = byEnd[e++];
+            int64_t yEnd = hsps[j].y + hsps[j].length;
+            int64_t lo = 0, hi = m; // rank of yEnd, 1 based
+            while (lo < hi) {
+                int64_t mid = (lo + hi) / 2;
+                if (yEnds[mid] < yEnd) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            for (int64_t r = lo + 1; r <= m; r += r & -r) {
+                if (best[j] > fenwickScore[r]) {
+                    fenwickScore[r] = best[j];
+                    fenwickIndex[r] = j;
+                }
+            }
+        }
+        // The best of them ending at or before its start in Y
+        int64_t lo = 0, hi = m; // number of yEnds <= hsps[i].y
+        while (lo < hi) {
+            int64_t mid = (lo + hi) / 2;
+            if (yEnds[mid] <= hsps[i].y) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        int64_t s = 0, p = -1;
+        for (int64_t r = lo; r > 0; r -= r & -r) {
+            if (fenwickScore[r] > s) {
+                s = fenwickScore[r];
+                p = fenwickIndex[r];
+            }
+        }
+        best[i] = hsps[i].score + s;
+        prev[i] = p;
+        if (bestEnd == -1 || best[i] > best[bestEnd]) {
+            bestEnd = i;
+        }
+    }
+    int64_t chainLength = 0;
+    for (int64_t i = bestEnd; i != -1; i = prev[i]) {
+        chainLength++;
+    }
+    SeedHsp *chain = st_malloc(sizeof(SeedHsp) * chainLength);
+    for (int64_t i = bestEnd, k = chainLength - 1; i != -1; i = prev[i], k--) {
+        chain[k] = hsps[i];
+    }
+    memcpy(hsps, chain, sizeof(SeedHsp) * chainLength);
+    *hspNumber = chainLength;
+    free(chain);
+    free(ends);
+    free(byEnd);
+    free(yEnds);
+    free(fenwickScore);
+    free(fenwickIndex);
+    free(best);
+    free(prev);
+}
+
+/*
+ * The HSP score needed in a box of the given area.  How high a score chance alone reaches grows
+ * with the log of the area searched, so a whole megabase-square problem needs a high one -- on
+ * unrelated random sequence, 2000 still lets 16 HSPs into the chain of a 1 Mb x 1 Mb search, and
+ * 2500 none -- while the gap between two anchors, a few hundred bases square and already known to
+ * sit between homologous sequence, can take a much lower one: 1000 finds nothing by chance in a
+ * 1 kb square.  Rises 250 per tenfold of area from minThreshold at 1e6, capped at maxThreshold.
+ */
+static int64_t seed_threshold(int64_t area, int64_t minThreshold, int64_t maxThreshold) {
+    double t = minThreshold + (area > 1000000 ? 250.0 * log10((double) area / 1000000.0) : 0.0);
+    return t > maxThreshold ? maxThreshold : (int64_t) t;
+}
+
+/*
+ * Appends to anchors, in order, the anchors between X[x0, x1) and Y[y0, y1): the chained HSPs,
+ * less constraintDiagonalTrim at each end, and, down to seedRecursionDepth levels, the anchors
+ * of the gaps between them that are big enough to be worth anchoring themselves.  The whole box
+ * takes seedHspThreshold; the gaps within it, flanked by anchors, the lower seed_threshold.
+ */
+static void seed_anchorBox(SeedSequence *sX, int64_t x0, int64_t x1, SeedSequence *sY, int64_t y0, int64_t y1,
+                           PairwiseAlignmentParameters *p, bool repeatMask, int64_t depth, stList *anchors) {
+    int64_t hspNumber;
+    int64_t threshold = depth == 0 ? p->seedHspThreshold :
+                        seed_threshold((x1 - x0) * (y1 - y0), p->seedHspThresholdMin, p->seedHspThreshold);
+    SeedHsp *hsps = seed_getHsps(sX, x0, x1, sY, y0, y1, repeatMask, threshold, p->seedXDrop, &hspNumber);
+    seed_chain(hsps, &hspNumber);
+    int64_t pX = x0, pY = y0;
+    for (int64_t i = 0; i <= hspNumber; i++) {
+        int64_t nX = i < hspNumber ? hsps[i].x : x1, nY = i < hspNumber ? hsps[i].y : y1;
+        int64_t gapSize = (nX - pX) * (nY - pY);
+        if (depth < p->seedRecursionDepth && gapSize > p->anchorMatrixBiggerThanThis && hspNumber > 0) { // not the whole box again
+            seed_anchorBox(sX, pX, nX, sY, pY, nY, p, gapSize > p->repeatMaskMatrixBiggerThanThis, depth + 1, anchors);
+        }
+        if (i < hspNumber) {
+            for (int64_t k = p->constraintDiagonalTrim; k < hsps[i].length - p->constraintDiagonalTrim; k++) {
+                stList_append(anchors, stIntTuple_construct3(hsps[i].x + k, hsps[i].y + k, p->diagonalExpansion));
+            }
+            pX = hsps[i].x + hsps[i].length;
+            pY = hsps[i].y + hsps[i].length;
+        }
+    }
+    free(hsps);
+}
+
+stList *getSeedAnchors(const char *sX, const char *sY, int64_t lX, int64_t lY, PairwiseAlignmentParameters *p) {
+    stList *anchors = stList_construct3(0, (void (*)(void *)) stIntTuple_destruct);
+    if (lX >= INT32_MAX || lY >= INT32_MAX) { // the index keeps positions in 32 bits; bar never asks for more than a megabase
+        st_logCritical("getSeedAnchors: sequences of %" PRIi64 " and %" PRIi64 " bases are too long to anchor\n", lX, lY);
+        return anchors;
+    }
+    SeedSequence seqX = seedSequence_construct(sX, lX), seqY = seedSequence_construct(sY, lY);
+    // Masked or not by the same rule as the gaps within: repeatMaskMatrixBiggerThanThis
+    seed_anchorBox(&seqX, 0, lX, &seqY, 0, lY, p, lX * lY > p->repeatMaskMatrixBiggerThanThis, 0, anchors);
+    seedSequence_destruct(seqX);
+    seedSequence_destruct(seqY);
+    return anchors;
+}

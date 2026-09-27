@@ -52,6 +52,10 @@ struct _stateMachine {
     //Cells (states at a given coordinate(
     void (*cellCalculate)(StateMachine *sM, double *current, double *lower, double *middle, double *upper, Symbol cX, Symbol cY,
             void(*doTransition)(double *, double *, int64_t, int64_t, double, double, void *), void *extraArgs);
+
+    // The machine flattened into arrays for the probability space forward-backward, made by pairwiseAligner.c the
+    // first time it is needed.  A machine's parameters are not to be changed once it has been used.
+    void *flat;
 };
 
 /*
