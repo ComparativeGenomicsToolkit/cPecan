@@ -51,6 +51,24 @@ MultipleAlignment *makeAlignment(StateMachine *sM, stList *seqFrags,
         float matchGamma,
         PairwiseAlignmentParameters *pairwiseAlignmentBandingParameters);
 
+/*
+ * Picks the machine to align one pair of sequences with, by their indices in seqFrags: lets one multiple
+ * alignment score different pairs with different models, e.g. by how diverged the pair's genomes are.
+ * Called once for each pairwise alignment, possibly from several threads if the caller aligns several
+ * MSAs at once.  The machine must outlive the alignment, and the same machine can be returned for any
+ * number of pairs.  NULL means the alignment's default machine.
+ */
+typedef StateMachine *(*PairStateMachineFn)(int64_t seqX, int64_t seqY, void *extraArgs);
+
+/*
+ * As makeAlignment, scoring each pair with the machine pairStateMachine picks for it (sM for any pair it
+ * returns NULL for, and for every pair when pairStateMachine is NULL).
+ */
+MultipleAlignment *makeAlignmentWithPairStateMachines(StateMachine *sM, PairStateMachineFn pairStateMachine, void *extraArgs,
+        stList *seqFrags, int64_t spanningTrees, int64_t maxPairsToConsider,
+        bool useProgressiveMerging, float matchGamma,
+        PairwiseAlignmentParameters *pairwiseAlignmentBandingParameters);
+
 MultipleAlignment *makeAlignmentUsingAllPairs(StateMachine *sM, stList *seqFrags,
         bool useProgressiveMerging, float matchGamma,
         PairwiseAlignmentParameters *pairwiseAlignmentBandingParameters);

@@ -231,6 +231,94 @@ static void test_multipleAlignerRandom(CuTest *testCase) {
     }
 }
 
+/*
+ * Per-pair machines: a chooser that records how it was asked and returns one fixed machine.
+ */
+typedef struct {
+    StateMachine *sM; // what to return for every pair (NULL for the default)
+    int64_t seqNo;
+    int64_t calls;
+    bool badPair;
+} PairChoice;
+
+static StateMachine *choosePairStateMachine(int64_t seqX, int64_t seqY, void *extraArgs) {
+    PairChoice *choice = extraArgs;
+    choice->calls++;
+    if (seqX < 0 || seqY < 0 || seqX >= choice->seqNo || seqY >= choice->seqNo || seqX == seqY) {
+        choice->badPair = 1;
+    }
+    return choice->sM;
+}
+
+static bool sameAlignedPairs(stList *pairs1, stList *pairs2) {
+    // as sets: the order the pairs come out in follows hashes of pointers, so differs from run to run
+    if (stList_length(pairs1) != stList_length(pairs2)) {
+        return 0;
+    }
+    stList *sorted1 = stList_copy(pairs1, NULL), *sorted2 = stList_copy(pairs2, NULL);
+    stList_sort(sorted1, (int (*)(const void *, const void *))stIntTuple_cmpFn);
+    stList_sort(sorted2, (int (*)(const void *, const void *))stIntTuple_cmpFn);
+    bool same = 1;
+    for (int64_t i = 0; i < stList_length(sorted1) && same; i++) {
+        same = stIntTuple_equalsFn(stList_get(sorted1, i), stList_get(sorted2, i));
+    }
+    stList_destruct(sorted1);
+    stList_destruct(sorted2);
+    return same;
+}
+
+static void test_makeAlignmentWithPairStateMachines(CuTest *testCase) {
+    int64_t differed = 0, repeatable = 0;
+    for (int64_t test = 0; test < 50; test++) {
+        setup();
+        // spanning trees from 1 to 4 over 2 to 9 sequences reach both the all-pairs and the spanning-tree path
+        stList *randomSeqFrags = getRandomSeqFrags(st_randomInt(2, 10), st_randomInt(20, 100));
+        int64_t seqNo = stList_length(randomSeqFrags);
+        int64_t spanningTrees = st_randomInt(1, 5);
+        bool progressive = st_random() > 0.5;
+        MultipleAlignment *mA = makeAlignment(stateMachine, randomSeqFrags, spanningTrees, 10000000, progressive, 0.5, pabp);
+        // makeAlignment can give different alignments of the same sequences from one call to the next (seen
+        // without progressive merging, on the spanning-tree path), so equality below is only asked for where it
+        // agrees with itself
+        MultipleAlignment *again = makeAlignment(stateMachine, randomSeqFrags, spanningTrees, 10000000, progressive, 0.5, pabp);
+        bool isRepeatable = sameAlignedPairs(mA->alignedPairs, again->alignedPairs);
+        repeatable += isRepeatable;
+        multipleAlignment_destruct(again);
+
+        // a chooser that returns NULL, or the default machine itself, changes nothing, and is asked once per
+        // pairwise alignment about a real pair of sequences
+        for (int64_t i = 0; i < 2; i++) {
+            PairChoice choice = { i == 0 ? NULL : stateMachine, seqNo, 0, 0 };
+            MultipleAlignment *mA2 = makeAlignmentWithPairStateMachines(stateMachine, choosePairStateMachine, &choice,
+                    randomSeqFrags, spanningTrees, 10000000, progressive, 0.5, pabp);
+            CuAssertTrue(testCase, !isRepeatable || sameAlignedPairs(mA->alignedPairs, mA2->alignedPairs));
+            CuAssertIntEquals(testCase, stList_length(mA2->chosenPairwiseAlignments), choice.calls);
+            CuAssertTrue(testCase, !choice.badPair);
+            multipleAlignment_destruct(mA2);
+        }
+
+        // another machine for every pair still gives a valid alignment, and, over the tests, a different one
+        Hmm *hmm = hmm_constructEmpty(0.0, fiveState);
+        hmm_randomise(hmm);
+        StateMachine *other = hmm_getStateMachine(hmm);
+        PairChoice choice = { other, seqNo, 0, 0 };
+        MultipleAlignment *mA3 = makeAlignmentWithPairStateMachines(stateMachine, choosePairStateMachine, &choice,
+                randomSeqFrags, spanningTrees, 10000000, progressive, 0.5, pabp);
+        checkAlignment(testCase, randomSeqFrags, mA3->alignedPairs);
+        CuAssertIntEquals(testCase, stList_length(mA3->chosenPairwiseAlignments), choice.calls);
+        differed += isRepeatable && !sameAlignedPairs(mA->alignedPairs, mA3->alignedPairs);
+        multipleAlignment_destruct(mA3);
+        stateMachine_destruct(other);
+        hmm_destruct(hmm);
+
+        multipleAlignment_destruct(mA);
+        stList_destruct(randomSeqFrags);
+        teardown();
+    }
+    CuAssertTrue(testCase, repeatable >= 40);
+    CuAssertTrue(testCase, differed > 0);
+}
+
 CuSuite* multipleAlignerTestSuite(void) {
     CuSuite* suite = CuSuiteNew();
     SUITE_ADD_TEST(suite, test_getDistanceMatrix);
@@ -241,6 +329,7 @@ CuSuite* multipleAlignerTestSuite(void) {
     SUITE_ADD_TEST(suite, test_makeAlignmentUsingAllPairs);
     SUITE_ADD_TEST(suite, test_multipleAlignerAllPairsRandom);
     SUITE_ADD_TEST(suite, test_multipleAlignerRandom);
+    SUITE_ADD_TEST(suite, test_makeAlignmentWithPairStateMachines);
 
     return suite;
 }
