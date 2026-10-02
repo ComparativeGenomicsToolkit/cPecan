@@ -63,7 +63,13 @@ int column_cmp(Column *c, Column *c2) {
 }
 
 uint64_t column_hashFn(Column *c) {
-    return c->seqName + c->position;
+    // Mixed, not summed: seqName + position put every sequence's positions on top of one another,
+    // so each bucket held a position from every sequence, and lookups here were a fifth of the
+    // runtime of a multiple alignment.
+    uint64_t h = (uint64_t) c->seqName * 0x9E3779B97F4A7C15ULL ^ (uint64_t) c->position;
+    h ^= h >> 31;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    return h ^ (h >> 29);
 }
 
 int column_equalsFn(Column *c, Column *c2) {
@@ -190,16 +196,20 @@ stSortedSet *makeOrderedSetOfAlignmentWeights(stHash *alignmentWeightAdjLists) {
 
 static void removeAlignmentFromSortedAlignmentWeights(AlignmentWeight *aW, stSortedSet *alignmentWeightsOrderedByWeight) {
     /*
-     * Removes the weight from the ordered set.
+     * Removes the weight from the ordered set, if one is being kept (the progressive merge does not need it).
      */
-    stSortedSet_remove(alignmentWeightsOrderedByWeight, aW->column < aW->rWeight->column ? aW : aW->rWeight);
+    if (alignmentWeightsOrderedByWeight != NULL) {
+        stSortedSet_remove(alignmentWeightsOrderedByWeight, aW->column < aW->rWeight->column ? aW : aW->rWeight);
+    }
 }
 
 static void insertAlignmentIntoSortedAlignmentWeights(AlignmentWeight *aW, stSortedSet *alignmentWeightsOrderedByWeight) {
     /*
-     * Adds weight to the ordered set.
+     * Adds weight to the ordered set, if one is being kept.
      */
-    stSortedSet_insert(alignmentWeightsOrderedByWeight, aW->column < aW->rWeight->column ? aW : aW->rWeight);
+    if (alignmentWeightsOrderedByWeight != NULL) {
+        stSortedSet_insert(alignmentWeightsOrderedByWeight, aW->column < aW->rWeight->column ? aW : aW->rWeight);
+    }
 }
 
 static void alignmentWeight_destruct(AlignmentWeight *aW) {
@@ -509,18 +519,359 @@ stList *makeColumnSequences(stList *seqFrags, stSet *columns) {
     return columnSequences;
 }
 
+/*
+ * The progressive merge, over arrays.
+ *
+ * The functions above keep a column's alignment weights in an AVL tree, find a column's tree
+ * through a hash, and find a column from its sequence position through another; the merge
+ * below spent most of its time in those lookups, and most of its memory -- over 200 bytes for
+ * each aligned pair -- on the trees' nodes and the weights' own allocations.  Here every column
+ * position has an id, (sequence, position) numbered in order, and the columns, their weights
+ * and the scratch the merge needs are arrays indexed by it.  The weights, two per aligned pair,
+ * sit in one block.  The merge makes the same choices in the same order with the same arithmetic
+ * as the functions above, which remain for the greedy method and the tests, and gives the same
+ * alignment.
+ */
+
+typedef struct _weightList { // a column's weights, in no particular order
+    AlignmentWeight **items;
+    int64_t length, capacity;
+    bool owned; // items was allocated for this list, rather than being its slice of the shared block
+} WeightList;
+
+typedef struct _progressiveMsa {
+    int64_t *seqOffsets; // the id of (seq, pos) is seqOffsets[seq] + pos
+    int64_t columnNumber;
+    Column **columns; // by id
+    bool *isHead; // by id: is the column's first position, and so the column, in the alignment
+    WeightList *weights; // by id, the weights of the column headed there
+    AlignmentWeight *weightPool; // the weights, two per aligned pair
+    AlignmentWeight **itemBlock; // the weight lists' first slices
+    AlignmentWeight **mark; // by id, scratch for merging: the weight to the column headed there, if any; else NULL
+    int64_t *yIndex, *yTag, tag; // by id, scratch for aligning two column-sequences: the index of the column in Y, if yTag is tag
+} ProgressiveMsa;
+
+static inline int64_t progressiveMsa_id(ProgressiveMsa *m, Column *c) {
+    return m->seqOffsets[c->seqName] + c->position;
+}
+
+static inline WeightList *progressiveMsa_weights(ProgressiveMsa *m, Column *c) {
+    return &m->weights[progressiveMsa_id(m, c)];
+}
+
+static void weightList_append(WeightList *l, AlignmentWeight *aW) {
+    if (l->length == l->capacity) {
+        int64_t capacity = l->capacity * 2 + 4;
+        AlignmentWeight **items = st_malloc(sizeof(AlignmentWeight *) * capacity);
+        memcpy(items, l->items, sizeof(AlignmentWeight *) * l->length);
+        if (l->owned) {
+            free(l->items);
+        }
+        l->items = items;
+        l->capacity = capacity;
+        l->owned = 1;
+    }
+    l->items[l->length++] = aW;
+}
+
+static void weightList_remove(WeightList *l, AlignmentWeight *aW) {
+    for (int64_t i = 0; i < l->length; i++) {
+        if (l->items[i] == aW) {
+            l->items[i] = l->items[--l->length];
+            return;
+        }
+    }
+    assert(0);
+}
+
+static ProgressiveMsa *progressiveMsa_construct(stList *seqFrags, stList *multipleAlignedPairs) {
+    ProgressiveMsa *m = st_calloc(1, sizeof(ProgressiveMsa));
+    int64_t seqNumber = stList_length(seqFrags);
+    m->seqOffsets = st_malloc(sizeof(int64_t) * (seqNumber + 1));
+    m->columnNumber = 0;
+    for (int64_t seq = 0; seq < seqNumber; seq++) {
+        m->seqOffsets[seq] = m->columnNumber;
+        m->columnNumber += ((SeqFrag *) stList_get(seqFrags, seq))->length;
+    }
+    m->seqOffsets[seqNumber] = m->columnNumber;
+    int64_t n = m->columnNumber;
+    // The columns, one per position, as makeColumns makes them
+    m->columns = st_malloc(sizeof(Column *) * (n + 1));
+    m->isHead = st_malloc(sizeof(bool) * (n + 1));
+    for (int64_t seq = 0; seq < seqNumber; seq++) {
+        for (int64_t pos = 0; pos < m->seqOffsets[seq + 1] - m->seqOffsets[seq]; pos++) {
+            Column *c = st_malloc(sizeof(Column));
+            c->seqName = seq;
+            c->position = pos;
+            c->nColumn = NULL;
+            m->columns[m->seqOffsets[seq] + pos] = c;
+            m->isHead[m->seqOffsets[seq] + pos] = 1;
+        }
+    }
+    // The weights, made in the order, and with the random tie breaking, that makeAlignmentWeightAdjacencyLists uses
+    int64_t pairNumber = stList_length(multipleAlignedPairs);
+    m->weights = st_calloc(n + 1, sizeof(WeightList));
+    for (int64_t i = 0; i < pairNumber; i++) { // each list's size, so each can have its own slice of one block
+        stIntTuple *aP = stList_get(multipleAlignedPairs, i);
+        m->weights[m->seqOffsets[stIntTuple_get(aP, 1)] + stIntTuple_get(aP, 2)].capacity++;
+        m->weights[m->seqOffsets[stIntTuple_get(aP, 3)] + stIntTuple_get(aP, 4)].capacity++;
+    }
+    m->itemBlock = st_malloc(sizeof(AlignmentWeight *) * (2 * pairNumber + 1));
+    for (int64_t i = 0, offset = 0; i < n; i++) {
+        m->weights[i].items = m->itemBlock + offset;
+        offset += m->weights[i].capacity;
+    }
+    m->weightPool = st_malloc(sizeof(AlignmentWeight) * (2 * pairNumber + 1));
+    for (int64_t i = 0; i < pairNumber; i++) {
+        /*Tuple of score, seq1, pos1, seq2, pos2 */
+        stIntTuple *aP = stList_get(multipleAlignedPairs, i);
+        assert(stIntTuple_length(aP) == 5);
+        int64_t score = stIntTuple_get(aP, 0);
+        int64_t id1 = m->seqOffsets[stIntTuple_get(aP, 1)] + stIntTuple_get(aP, 2);
+        int64_t id2 = m->seqOffsets[stIntTuple_get(aP, 3)] + stIntTuple_get(aP, 4);
+        AlignmentWeight *aW = &m->weightPool[2 * i], *rW = &m->weightPool[2 * i + 1];
+        aW->column = m->columns[id1];
+        aW->numberOfWeights = 1;
+        aW->avgWeight = ((double) score) / PAIR_ALIGNMENT_PROB_1 + st_random() * 0.00001; // as makeAlignmentWeight
+        rW->column = m->columns[id2];
+        rW->numberOfWeights = 1;
+        rW->avgWeight = ((double) score) / PAIR_ALIGNMENT_PROB_1 + st_random() * 0.00001;
+        aW->rWeight = rW;
+        rW->rWeight = aW;
+        // A weight lives in the list of the column at the other end of it, as insertWeight puts it
+        m->weights[id2].items[m->weights[id2].length++] = aW;
+        m->weights[id1].items[m->weights[id1].length++] = rW;
+    }
+    m->mark = st_calloc(n + 1, sizeof(AlignmentWeight *));
+    m->yIndex = st_malloc(sizeof(int64_t) * (n + 1));
+    m->yTag = st_calloc(n + 1, sizeof(int64_t));
+    m->tag = 0;
+    return m;
+}
+
+static void progressiveMsa_destruct(ProgressiveMsa *m) {
+    for (int64_t i = 0; i < m->columnNumber; i++) {
+        if (m->weights[i].owned) {
+            free(m->weights[i].items);
+        }
+    }
+    free(m->weights);
+    free(m->itemBlock);
+    free(m->weightPool);
+    free(m->seqOffsets);
+    free(m->columns); // the Columns themselves belong to whoever has the set of them
+    free(m->isHead);
+    free(m->mark);
+    free(m->yIndex);
+    free(m->yTag);
+    free(m);
+}
+
+/*
+ * As mergeColumns.
+ */
+static Column *progressiveMsa_merge(ProgressiveMsa *m, AlignmentWeight *aW) {
+    if (progressiveMsa_weights(m, aW->column)->length < progressiveMsa_weights(m, aW->rWeight->column)->length) {
+        aW = aW->rWeight;
+    }
+    Column *c1 = aW->column, *c2 = aW->rWeight->column;
+    assert(c1 != c2);
+    WeightList *l1 = progressiveMsa_weights(m, c1), *l2 = progressiveMsa_weights(m, c2);
+    assert(l1->length >= l2->length);
+    // Merge the columns
+    Column *c = c1;
+    while (c->nColumn != NULL) {
+        c = c->nColumn;
+    }
+    c->nColumn = c2;
+    m->isHead[progressiveMsa_id(m, c2)] = 0;
+    // Drop the merging weight
+    weightList_remove(l1, aW->rWeight);
+    weightList_remove(l2, aW);
+    // Merge each of c2's remaining weights into c1's to the same column, or move it across if c1 has none
+    for (int64_t i = 0; i < l1->length; i++) {
+        m->mark[progressiveMsa_id(m, l1->items[i]->column)] = l1->items[i];
+    }
+    for (int64_t i = 0; i < l2->length; i++) {
+        AlignmentWeight *aW2 = l2->items[i];
+        AlignmentWeight *aW1 = m->mark[progressiveMsa_id(m, aW2->column)];
+        if (aW1 != NULL) {
+            weightList_remove(progressiveMsa_weights(m, aW2->column), aW2->rWeight);
+            aW1->avgWeight = ((aW1->avgWeight * aW1->numberOfWeights) + (aW2->avgWeight * aW2->numberOfWeights)) /
+                             (aW1->numberOfWeights + aW2->numberOfWeights);
+            aW1->numberOfWeights += aW2->numberOfWeights;
+            aW1->rWeight->avgWeight = aW1->avgWeight;
+            aW1->rWeight->numberOfWeights = aW1->numberOfWeights;
+        } else {
+            aW2->rWeight->column = c1;
+            weightList_append(l1, aW2);
+        }
+    }
+    for (int64_t i = 0; i < l1->length; i++) {
+        m->mark[progressiveMsa_id(m, l1->items[i]->column)] = NULL;
+    }
+    if (l2->owned) {
+        free(l2->items);
+    }
+    l2->items = NULL;
+    l2->length = 0;
+    l2->capacity = 0;
+    l2->owned = 0;
+    return c1;
+}
+
+static int64_t progressiveMsa_totalWeights(ProgressiveMsa *m, stList *seqColumns) {
+    int64_t totalWeights = 0;
+    for (int64_t i = 0; i < stList_length(seqColumns); i++) {
+        totalWeights += progressiveMsa_weights(m, stList_get(seqColumns, i))->length;
+    }
+    return totalWeights;
+}
+
+/*
+ * As pairwiseAlignColumns.
+ */
+static stList *progressiveMsa_alignColumns(ProgressiveMsa *m, stList *seqXColumns, stList *seqYColumns, double matchGamma) {
+    //Switch seqX and seqY if seqX has more alignment weights associated with it. This is critical to ensure linear scaling,
+    //else worse case performance is quadratic
+    if (progressiveMsa_totalWeights(m, seqXColumns) > progressiveMsa_totalWeights(m, seqYColumns)) {
+        stList *l = seqYColumns;
+        seqYColumns = seqXColumns;
+        seqXColumns = l;
+    }
+
+    //Index the columns of Y
+    m->tag++;
+    for (int64_t i = 0; i < stList_length(seqYColumns); i++) {
+        int64_t id = progressiveMsa_id(m, stList_get(seqYColumns, i));
+        m->yIndex[id] = i;
+        m->yTag[id] = m->tag;
+    }
+
+    //Best scoring pairs
+    stSortedSet *bestScoringAlignments = stSortedSet_construct3(columnPair_cmpByYIndex, (void(*)(void *)) columnPair_destruct);
+    //Add in buffering first and last pairs
+    ColumnPair *minPair = columnPair_construct(-1, -1, 0, NULL, NULL);
+    stSortedSet_insert(bestScoringAlignments, minPair);
+    stSortedSet_insert(bestScoringAlignments, columnPair_construct(stList_length(seqXColumns), stList_length(seqYColumns), INT64_MAX, minPair, NULL));
+
+    //For each column in X.
+    stList *l = stList_construct();
+    for (int64_t i = 0; i < stList_length(seqXColumns); i++) {
+        WeightList *aWsX = progressiveMsa_weights(m, stList_get(seqXColumns, i));
+        //We first get all the valid new column pairs.
+        for (int64_t k = 0; k < aWsX->length; k++) {
+            AlignmentWeight *aWX = aWsX->items[k];
+            //Add pair if exceeds the gap gamma.
+            if (aWX->avgWeight >= matchGamma && aWX->avgWeight > 0.0) { //Must be greater than zero else screws up dynamic programming assumptions
+                //The column weight may point to a column not in the Y column sequence, if so ignore.
+                int64_t id = progressiveMsa_id(m, aWX->column);
+                if (m->yTag[id] == m->tag) {
+                    ColumnPair cP;
+                    cP.yIndex = m->yIndex[id];
+                    //Search for highest scoring point up to but less than that index.
+                    ColumnPair *cPP = stSortedSet_searchLessThan(bestScoringAlignments, &cP);
+                    assert(cPP != NULL);
+                    assert(i - cPP->xIndex > 0);
+                    assert(cP.yIndex - cPP->yIndex > 0);
+                    assert(cPP->score + aWX->avgWeight * aWX->numberOfWeights > cPP->score);
+                    stList_append(l, columnPair_construct(i, cP.yIndex, /*new score */ cPP->score + aWX->avgWeight * aWX->numberOfWeights, cPP, aWX)); //Make first to increase ref-count of previous position.
+                }
+            }
+        }
+        //We now work through the new column pairs, from right-to-left along Y.
+        stList_sort(l, columnPair_cmpByYIndex);
+        while(stList_length(l) > 0) {
+            ColumnPair *cP = stList_pop(l);
+            //Find point that is equal or to the right of cP->yIndex
+            ColumnPair *cPN = stSortedSet_searchGreaterThanOrEqual(bestScoringAlignments, cP);
+            assert(cPN != NULL);
+            if (cP->score >= cPN->score || cPN->yIndex > cP->yIndex) {
+                //Remove points that overlap or are to the right that score more poorly and clean them up.
+                while (cP->score >= cPN->score) {
+                    ColumnPair *cPNN = stSortedSet_searchGreaterThan(bestScoringAlignments, cPN);
+                    assert(cPNN != NULL);
+                    stSortedSet_remove(bestScoringAlignments, cPN);
+                    columnPair_destruct(cPN);
+                    cPN = cPNN;
+                }
+                //Insert new point.
+                assert(stSortedSet_search(bestScoringAlignments, cP) == NULL);
+                stSortedSet_insert(bestScoringAlignments, cP);
+            }
+            else { //The new cP is redundant.
+                columnPair_destruct(cP);
+            }
+        }
+    }
+    stList_destruct(l);
+
+    //Link the right-most Y pair to the next-right most.
+    ColumnPair *maxPair = stSortedSet_getLast(bestScoringAlignments);
+    assert(maxPair != NULL);
+    stSortedSet_remove(bestScoringAlignments, maxPair);
+    assert(stSortedSet_getLast(bestScoringAlignments) != NULL);
+    maxPair->pPair = stSortedSet_getLast(bestScoringAlignments);
+    maxPair->pPair->refCount++;
+
+    //Now traceback from highest scoring point to generate the alignment
+    ColumnPair *cP = maxPair;
+    stList *alignment = stList_construct();
+    int64_t merges = 0;
+    while (1) {
+        assert(cP->pPair != NULL);
+        //Add any unaligned Y columns
+        assert(cP->yIndex > cP->pPair->yIndex);
+        while (--cP->yIndex > cP->pPair->yIndex) {
+            stList_append(alignment, stList_get(seqYColumns, cP->yIndex));
+        }
+        //Add any unaligned X columns
+        assert(cP->xIndex > cP->pPair->xIndex);
+        while (--cP->xIndex > cP->pPair->xIndex) {
+            stList_append(alignment, stList_get(seqXColumns, cP->xIndex));
+        }
+        //Now move to previous pair
+        cP = cP->pPair;
+        //If this is the final pair we're done
+        if (cP == minPair) {
+            break;
+        }
+        //Merge two columns.
+        stList_append(alignment, progressiveMsa_merge(m, cP->aW));
+        merges++;
+    }
+    assert(stList_length(alignment) + merges == stList_length(seqXColumns) + stList_length(seqYColumns));
+    //Make the list of columns left-to-right
+    stList_reverse(alignment);
+
+    //Cleanup
+    assert(maxPair->refCount == 1);
+    columnPair_destruct(maxPair);
+    stSortedSet_destruct(bestScoringAlignments);
+    assert(minPair->refCount == 1);
+    columnPair_destruct(minPair);
+    stList_destruct(seqXColumns);
+    stList_destruct(seqYColumns);
+
+    return alignment;
+}
+
 stSet *getMultipleSequenceAlignmentProgressive(stList *seqFrags, stList *multipleAlignedPairs, double matchGamma, stList *seqPairSimilarityScores) {
-    //Get the data-structures needed for the pairwise alignments
-    stSet *columns = makeColumns(seqFrags);
-    stHash *alignmentWeightAdjLists = makeAlignmentWeightAdjacencyLists(columns, multipleAlignedPairs);
-    stSortedSet *alignmentWeightsOrderedByWeight = makeOrderedSetOfAlignmentWeights(alignmentWeightAdjLists);
+    ProgressiveMsa *m = progressiveMsa_construct(seqFrags, multipleAlignedPairs);
 
     //sort list of pairwise distances
     seqPairSimilarityScores = stList_copy(seqPairSimilarityScores, NULL);
     stList_sort(seqPairSimilarityScores, (int(*)(const void *, const void *)) stIntTuple_cmpFn);
 
     //get list of column-sequences
-    stList *columnSequences = makeColumnSequences(seqFrags, columns);
+    stList *columnSequences = stList_construct();
+    for (int64_t seq = 0; seq < stList_length(seqFrags); seq++) {
+        stList *columnSequence = stList_construct();
+        for (int64_t id = m->seqOffsets[seq]; id < m->seqOffsets[seq + 1]; id++) {
+            stList_append(columnSequence, m->columns[id]);
+        }
+        stList_append(columnSequences, columnSequence);
+    }
 
     //do n-1 merges
     while (stList_length(seqPairSimilarityScores) > 0) {
@@ -533,7 +884,7 @@ stSet *getMultipleSequenceAlignmentProgressive(stList *seqFrags, stList *multipl
         stList *seqXColumns = stList_get(columnSequences, seqX);
         stList *seqYColumns = stList_get(columnSequences, seqY);
         if (seqXColumns != seqYColumns) {
-            stList *seqColumns = pairwiseAlignColumns(seqXColumns, seqYColumns, alignmentWeightAdjLists, columns, alignmentWeightsOrderedByWeight, matchGamma);
+            stList *seqColumns = progressiveMsa_alignColumns(m, seqXColumns, seqYColumns, matchGamma);
             for(int64_t i=0; i<stList_length(columnSequences); i++) { //Replace instances of seqXColumns and seqYColumns with seqColumns
                 stList *j = stList_get(columnSequences, i);
                 if(j == seqXColumns || j == seqYColumns) {
@@ -543,15 +894,22 @@ stSet *getMultipleSequenceAlignmentProgressive(stList *seqFrags, stList *multipl
         }
     }
 
+    //The columns of the alignment, each under its first position
+    stSet *columns = stSet_construct3((uint64_t(*)(const void *)) column_hashFn, (int(*)(const void *, const void *)) column_equalsFn,
+                                      (void(*)(void *)) column_destruct);
+    for (int64_t id = 0; id < m->columnNumber; id++) {
+        if (m->isHead[id]) {
+            stSet_insert(columns, m->columns[id]);
+        }
+    }
+
     //Clean up
-    stSortedSet_destruct(alignmentWeightsOrderedByWeight);
-    stHash_destruct(alignmentWeightAdjLists);
     if(stList_length(columnSequences) > 0) {
         stList_destruct(stList_peek(columnSequences)); //This is because we have repeated copies of the same column-sequence in the list
     }
     stList_destruct(columnSequences);
     stList_destruct(seqPairSimilarityScores);
-    //Return final set of columns.
+    progressiveMsa_destruct(m);
     return columns;
 }
 
@@ -559,44 +917,61 @@ stSet *getMultipleSequenceAlignmentProgressive(stList *seqFrags, stList *multipl
  * Methods to extract consistent pairs.
  */
 
-static Column *getColumn2(stHash *columns, int64_t seq, int64_t pos) {
-    Column c;
-    c.seqName = seq;
-    c.position = pos;
-    return stHash_search(columns, &c);
-}
-
 stList *filterMultipleAlignedPairs(stSet *columns, stList *multipleAlignedPairs) {
     /*
      * Processes the list of multipleAlignedPairs and places those that align pairs within the same column in a list which is
      * returned. Pairs that do not make the list are cleaned up, as is the input list.
+     *
+     * Positions are numbered as in the progressive merge, from the columns themselves, so the column each is in is an array lookup.
      */
-    //Build hash of positions to columns
+    int64_t seqNumber = 0;
     stSetIterator *it = stSet_getIterator(columns);
     Column *c;
-    stHash *positionsToColumns = stHash_construct3((uint64_t(*)(const void *)) column_hashFn,
-            (int(*)(const void *, const void *)) column_equalsFn, NULL, NULL);
     while ((c = stSet_getNext(it)) != NULL) {
-        Column *c2 = c;
-        do {
-            stHash_insert(positionsToColumns, c2, c);
-            c2 = c2->nColumn;
-        } while (c2 != NULL);
+        for (Column *c2 = c; c2 != NULL; c2 = c2->nColumn) {
+            seqNumber = c2->seqName + 1 > seqNumber ? c2->seqName + 1 : seqNumber;
+        }
+    }
+    stSet_destructIterator(it);
+    int64_t *seqOffsets = st_calloc(seqNumber + 1, sizeof(int64_t)); // first the length of each sequence, then the offsets
+    it = stSet_getIterator(columns);
+    while ((c = stSet_getNext(it)) != NULL) {
+        for (Column *c2 = c; c2 != NULL; c2 = c2->nColumn) {
+            seqOffsets[c2->seqName] = c2->position + 1 > seqOffsets[c2->seqName] ? c2->position + 1 : seqOffsets[c2->seqName];
+        }
+    }
+    stSet_destructIterator(it);
+    int64_t total = 0;
+    for (int64_t seq = 0; seq <= seqNumber; seq++) {
+        int64_t length = seqOffsets[seq];
+        seqOffsets[seq] = total;
+        total += length;
+    }
+    Column **positionsToColumns = st_calloc(total + 1, sizeof(Column *));
+    it = stSet_getIterator(columns);
+    while ((c = stSet_getNext(it)) != NULL) {
+        for (Column *c2 = c; c2 != NULL; c2 = c2->nColumn) {
+            positionsToColumns[seqOffsets[c2->seqName] + c2->position] = c;
+        }
     }
     stSet_destructIterator(it);
     //Now walk through pairs
     stList *filteredMultipleAlignedPairs = stList_construct3(0, (void(*)(void *)) stIntTuple_destruct);
     while (stList_length(multipleAlignedPairs) > 0) {
         stIntTuple *mAP = stList_pop(multipleAlignedPairs);
-        if (getColumn2(positionsToColumns, stIntTuple_get(mAP, 1), stIntTuple_get(mAP, 2)) == getColumn2(positionsToColumns,
-                stIntTuple_get(mAP, 3), stIntTuple_get(mAP, 4))) {
+        int64_t seq1 = stIntTuple_get(mAP, 1), pos1 = stIntTuple_get(mAP, 2);
+        int64_t seq2 = stIntTuple_get(mAP, 3), pos2 = stIntTuple_get(mAP, 4);
+        Column *c1 = seq1 < seqNumber && pos1 < seqOffsets[seq1 + 1] - seqOffsets[seq1] ? positionsToColumns[seqOffsets[seq1] + pos1] : NULL;
+        Column *c2 = seq2 < seqNumber && pos2 < seqOffsets[seq2 + 1] - seqOffsets[seq2] ? positionsToColumns[seqOffsets[seq2] + pos2] : NULL;
+        if (c1 == c2) {
             stList_append(filteredMultipleAlignedPairs, mAP);
         } else {
             stIntTuple_destruct(mAP);
         }
     }
     //Cleanup
-    stHash_destruct(positionsToColumns);
+    free(positionsToColumns);
+    free(seqOffsets);
     stList_destruct(multipleAlignedPairs);
     return filteredMultipleAlignedPairs;
 }

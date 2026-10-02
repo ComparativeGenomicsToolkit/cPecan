@@ -516,6 +516,7 @@ StateMachine *stateMachine5_construct(StateMachineType type) {
     sM5->model.raggedStartStateProb = stateMachine5_raggedStartStateProb;
     sM5->model.raggedEndStateProb = stateMachine5_raggedEndStateProb;
     sM5->model.cellCalculate = stateMachine5_cellCalculate;
+    sM5->model.flat = NULL;
 
     return (StateMachine *) sM5;
 }
@@ -740,6 +741,7 @@ StateMachine *stateMachine3_construct(StateMachineType type) {
     sM3->model.raggedStartStateProb = stateMachine3_raggedStartStateProb;
     sM3->model.raggedEndStateProb = stateMachine3_raggedEndStateProb;
     sM3->model.cellCalculate = stateMachine3_cellCalculate;
+    sM3->model.flat = NULL;
 
     return (StateMachine *) sM3;
 }
@@ -819,5 +821,6 @@ StateMachine *hmm_getStateMachine(Hmm *hmm) {
 }
 
 void stateMachine_destruct(StateMachine *stateMachine) {
+    free(stateMachine->flat);
     free(stateMachine);
 }
