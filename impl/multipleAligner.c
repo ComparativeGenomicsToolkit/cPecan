@@ -62,6 +62,38 @@ int column_cmp(Column *c, Column *c2) {
             : (c->position < c2->position ? -1 : 0)));
 }
 
+/*
+ * Deterministic stand-ins for the random numbers this file used to draw from sonLib's global generator.
+ * Those made an alignment depend on that generator's state -- so on whatever had run before it, and in a
+ * multithreaded caller on thread timing -- and pointer comparisons made it depend on where things had been
+ * allocated.  Now the same sequences give the same alignment.
+ */
+static uint64_t mix64(uint64_t h) {
+    h ^= h >> 30;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    h ^= h >> 27;
+    h *= 0x94D049BB133111EBULL;
+    return h ^ (h >> 31);
+}
+
+static uint64_t pairHash(int64_t seq1, int64_t pos1, int64_t seq2, int64_t pos2) {
+    // the same either way round
+    if (seq1 > seq2 || (seq1 == seq2 && pos1 > pos2)) {
+        int64_t s = seq1, p = pos1;
+        seq1 = seq2, pos1 = pos2, seq2 = s, pos2 = p;
+    }
+    return mix64(mix64((uint64_t) seq1 * 0x9E3779B97F4A7C15ULL ^ (uint64_t) pos1) ^ ((uint64_t) seq2 * 0xC2B2AE3D27D4EB4FULL + (uint64_t) pos2));
+}
+
+/*
+ * The tie-breaking jitter added to an aligned pair's weight, in [0, 0.00001) like the random one it
+ * replaces (which kept the merge order from degenerating into badly unbalanced trees, without affecting
+ * accuracy).  Both directions of the pair get the same value.
+ */
+static double weightJitter(int64_t seq1, int64_t pos1, int64_t seq2, int64_t pos2) {
+    return (double) (pairHash(seq1, pos1, seq2, pos2) >> 11) / 9007199254740992.0 * 0.00001;
+}
+
 uint64_t column_hashFn(Column *c) {
     // Mixed, not summed: seqName + position put every sequence's positions on top of one another,
     // so each bucket held a position from every sequence, and lookups here were a fifth of the
@@ -116,12 +148,21 @@ int alignmentWeight_cmpByPosition(AlignmentWeight *aW, AlignmentWeight *aW2) {
 
 int alignmentWeight_cmpByWeight(AlignmentWeight *aW, AlignmentWeight *aW2) {
     /*
-     * Cmp primarily by weight, then position.
+     * Cmp primarily by weight, then by the columns the weights join (not by address, which would make
+     * the order depend on where the weights were allocated).
      */
     if (aW->avgWeight == aW2->avgWeight) {
-        return aW < aW2 ? -1 : (aW > aW2 ? 1 : 0);
+        int i = column_cmp(aW->column, aW2->column);
+        return i != 0 ? i : column_cmp(aW->rWeight->column, aW2->rWeight->column);
     }
     return aW->avgWeight > aW2->avgWeight ? 1 : -1;
+}
+
+/*
+ * Of a weight and its reverse, the one kept in the set ordered by weight: the one from the lesser column.
+ */
+static bool alignmentWeight_isCanonical(AlignmentWeight *aW) {
+    return column_cmp(aW->column, aW->rWeight->column) < 0;
 }
 
 void insertWeight(AlignmentWeight *aW, stHash *alignmentWeightAdjLists) {
@@ -143,12 +184,12 @@ static Column *getColumn(stSet *columns, int64_t seqName, int64_t position) {
     return stSet_search(columns, &c);
 }
 
-static AlignmentWeight *makeAlignmentWeight(stSet *columns, int64_t score, int64_t seqName, int64_t position) {
+static AlignmentWeight *makeAlignmentWeight(stSet *columns, double weight, int64_t seqName, int64_t position) {
     AlignmentWeight *aW = st_malloc(sizeof(AlignmentWeight));
     aW->column = getColumn(columns, seqName, position);
     assert(aW->column != NULL);
     aW->numberOfWeights = 1;
-    aW->avgWeight = ((double) score) / PAIR_ALIGNMENT_PROB_1 + st_random() * 0.00001; //This randomness avoids nasty types of unbalanced trees and doesn't really affect accuracy
+    aW->avgWeight = weight;
     return aW;
 }
 
@@ -161,8 +202,10 @@ stHash *makeAlignmentWeightAdjacencyLists(stSet *columns, stList *multipleAligne
         /*Tuple of score, seq1, pos1, seq2, pos2 */
         stIntTuple *aP = stList_get(multipleAlignedPairs, i);
         assert(stIntTuple_length(aP) == 5);
-        AlignmentWeight *aW = makeAlignmentWeight(columns, stIntTuple_get(aP, 0), stIntTuple_get(aP, 1), stIntTuple_get(aP, 2));
-        aW->rWeight = makeAlignmentWeight(columns, stIntTuple_get(aP, 0), stIntTuple_get(aP, 3), stIntTuple_get(aP, 4));
+        double weight = ((double) stIntTuple_get(aP, 0)) / PAIR_ALIGNMENT_PROB_1 +
+                        weightJitter(stIntTuple_get(aP, 1), stIntTuple_get(aP, 2), stIntTuple_get(aP, 3), stIntTuple_get(aP, 4));
+        AlignmentWeight *aW = makeAlignmentWeight(columns, weight, stIntTuple_get(aP, 1), stIntTuple_get(aP, 2));
+        aW->rWeight = makeAlignmentWeight(columns, weight, stIntTuple_get(aP, 3), stIntTuple_get(aP, 4));
         aW->rWeight->rWeight = aW;
         insertWeight(aW, alignmentWeightAdjLists);
         insertWeight(aW->rWeight, alignmentWeightAdjLists);
@@ -184,7 +227,7 @@ stSortedSet *makeOrderedSetOfAlignmentWeights(stHash *alignmentWeightAdjLists) {
         AlignmentWeight *aW;
         while ((aW = stSortedSet_getNext(aWIt)) != NULL) {
             assert(aW->column != aW->rWeight->column);
-            if (aW->column < aW->rWeight->column) {
+            if (alignmentWeight_isCanonical(aW)) {
                 stSortedSet_insert(alignmentWeightsOrderedByWeight, aW);
             }
         }
@@ -199,7 +242,7 @@ static void removeAlignmentFromSortedAlignmentWeights(AlignmentWeight *aW, stSor
      * Removes the weight from the ordered set, if one is being kept (the progressive merge does not need it).
      */
     if (alignmentWeightsOrderedByWeight != NULL) {
-        stSortedSet_remove(alignmentWeightsOrderedByWeight, aW->column < aW->rWeight->column ? aW : aW->rWeight);
+        stSortedSet_remove(alignmentWeightsOrderedByWeight, alignmentWeight_isCanonical(aW) ? aW : aW->rWeight);
     }
 }
 
@@ -208,7 +251,7 @@ static void insertAlignmentIntoSortedAlignmentWeights(AlignmentWeight *aW, stSor
      * Adds weight to the ordered set, if one is being kept.
      */
     if (alignmentWeightsOrderedByWeight != NULL) {
-        stSortedSet_insert(alignmentWeightsOrderedByWeight, aW->column < aW->rWeight->column ? aW : aW->rWeight);
+        stSortedSet_insert(alignmentWeightsOrderedByWeight, alignmentWeight_isCanonical(aW) ? aW : aW->rWeight);
     }
 }
 
@@ -608,7 +651,7 @@ static ProgressiveMsa *progressiveMsa_construct(stList *seqFrags, stList *multip
             m->isHead[m->seqOffsets[seq] + pos] = 1;
         }
     }
-    // The weights, made in the order, and with the random tie breaking, that makeAlignmentWeightAdjacencyLists uses
+    // The weights, made in the order, and with the tie-breaking jitter, that makeAlignmentWeightAdjacencyLists uses
     int64_t pairNumber = stList_length(multipleAlignedPairs);
     m->weights = st_calloc(n + 1, sizeof(WeightList));
     for (int64_t i = 0; i < pairNumber; i++) { // each list's size, so each can have its own slice of one block
@@ -630,12 +673,14 @@ static ProgressiveMsa *progressiveMsa_construct(stList *seqFrags, stList *multip
         int64_t id1 = m->seqOffsets[stIntTuple_get(aP, 1)] + stIntTuple_get(aP, 2);
         int64_t id2 = m->seqOffsets[stIntTuple_get(aP, 3)] + stIntTuple_get(aP, 4);
         AlignmentWeight *aW = &m->weightPool[2 * i], *rW = &m->weightPool[2 * i + 1];
+        double weight = ((double) score) / PAIR_ALIGNMENT_PROB_1 +
+                        weightJitter(stIntTuple_get(aP, 1), stIntTuple_get(aP, 2), stIntTuple_get(aP, 3), stIntTuple_get(aP, 4));
         aW->column = m->columns[id1];
         aW->numberOfWeights = 1;
-        aW->avgWeight = ((double) score) / PAIR_ALIGNMENT_PROB_1 + st_random() * 0.00001; // as makeAlignmentWeight
+        aW->avgWeight = weight;
         rW->column = m->columns[id2];
         rW->numberOfWeights = 1;
-        rW->avgWeight = ((double) score) / PAIR_ALIGNMENT_PROB_1 + st_random() * 0.00001;
+        rW->avgWeight = weight;
         aW->rWeight = rW;
         rW->rWeight = aW;
         // A weight lives in the list of the column at the other end of it, as insertWeight puts it
@@ -1271,7 +1316,9 @@ int64_t getNextBestPair(int64_t seq1, int64_t *distanceCounts, int64_t seqNo,
     for (int64_t seq2 = 0; seq2 < seqNo; seq2++) {
         if (seq1 != seq2) {
             double gain = distances[seq2] - subsPerSite(seq1, seq2, distanceCounts, seqNo);
-            if (gain > maxGain || (gain == maxGain && st_random() > 0.5) /*lame attempt to reduce always picking the same seq*/) {
+            // ties go by a hash of the pair, which spreads the choice over the sequences (the point of the coin
+            // flip this replaces) without making it differ from one run to the next
+            if (gain > maxGain || (gain == maxGain && pairHash(seq1, 0, seq2, 0) > pairHash(seq1, 0, maxGainSeq, 0))) {
                 stIntTuple *pairToAlign = makePairToAlign(seq1, seq2);
                 if (stSortedSet_search(chosenPairsOfSequencesToAlign, pairToAlign) == NULL) { //So that any pair is unique
                     maxGain = gain;
