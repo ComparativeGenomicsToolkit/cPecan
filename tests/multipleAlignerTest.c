@@ -231,6 +231,75 @@ static void test_multipleAlignerRandom(CuTest *testCase) {
     }
 }
 
+static bool sameTuples(stList *tuples1, stList *tuples2) {
+    // in order, as well as in content
+    if (stList_length(tuples1) != stList_length(tuples2)) {
+        return 0;
+    }
+    for (int64_t i = 0; i < stList_length(tuples1); i++) {
+        if (!stIntTuple_equalsFn(stList_get(tuples1, i), stList_get(tuples2, i))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static bool sameColumns(stSet *columns1, stSet *columns2) {
+    // each column the same positions, in the same order
+    if (stSet_size(columns1) != stSet_size(columns2)) {
+        return 0;
+    }
+    bool same = 1;
+    stSetIterator *it = stSet_getIterator(columns1);
+    Column *c;
+    while (same && (c = stSet_getNext(it)) != NULL) {
+        Column *c1 = c, *c2 = stSet_search(columns2, c);
+        while (c1 != NULL && c2 != NULL && c1->seqName == c2->seqName && c1->position == c2->position) {
+            c1 = c1->nColumn;
+            c2 = c2->nColumn;
+        }
+        same = c1 == NULL && c2 == NULL;
+    }
+    stSet_destructIterator(it);
+    return same;
+}
+
+static bool sameMultipleAlignment(MultipleAlignment *mA, MultipleAlignment *mA2) {
+    return sameTuples(mA->alignedPairs, mA2->alignedPairs) &&
+           sameTuples(mA->chosenPairwiseAlignments, mA2->chosenPairwiseAlignments) &&
+           sameColumns(mA->columns, mA2->columns);
+}
+
+/*
+ * The same sequences give the same alignment, whatever ran before: neither the state of the random number
+ * generator nor where memory is allocated makes a difference.
+ */
+static void test_multipleAlignerRepeatable(CuTest *testCase) {
+    for (int64_t test = 0; test < 100; test++) {
+        setup();
+        // spanning trees from 1 to 4 over 2 to 9 sequences reach both the all-pairs and the spanning-tree path, and
+        // sometimes few enough pairs are considered for the distances that which columns give them matters
+        stList *randomSeqFrags = getRandomSeqFrags(st_randomInt(2, 10), st_randomInt(20, 100));
+        int64_t spanningTrees = st_randomInt(1, 5);
+        int64_t maxPairsToConsider = st_random() > 0.5 ? 10000000 : st_randomInt(1, 200);
+        bool progressive = st_random() > 0.5;
+        MultipleAlignment *mA = makeAlignment(stateMachine, randomSeqFrags, spanningTrees, maxPairsToConsider, progressive, 0.5, pabp);
+        // move the generator on, and hold some memory so that the second alignment's allocations land elsewhere
+        stList *junk = stList_construct3(0, free);
+        for (int64_t i = st_randomInt(1, 1000); i > 0; i--) {
+            stList_append(junk, st_malloc(st_randomInt(1, 200)));
+        }
+        MultipleAlignment *mA2 = makeAlignment(stateMachine, randomSeqFrags, spanningTrees, maxPairsToConsider, progressive, 0.5, pabp);
+        checkAlignment(testCase, randomSeqFrags, mA2->alignedPairs);
+        CuAssertTrue(testCase, sameMultipleAlignment(mA, mA2));
+        stList_destruct(junk);
+        multipleAlignment_destruct(mA2);
+        multipleAlignment_destruct(mA);
+        stList_destruct(randomSeqFrags);
+        teardown();
+    }
+}
+
 CuSuite* multipleAlignerTestSuite(void) {
     CuSuite* suite = CuSuiteNew();
     SUITE_ADD_TEST(suite, test_getDistanceMatrix);
@@ -241,6 +310,7 @@ CuSuite* multipleAlignerTestSuite(void) {
     SUITE_ADD_TEST(suite, test_makeAlignmentUsingAllPairs);
     SUITE_ADD_TEST(suite, test_multipleAlignerAllPairsRandom);
     SUITE_ADD_TEST(suite, test_multipleAlignerRandom);
+    SUITE_ADD_TEST(suite, test_multipleAlignerRepeatable);
 
     return suite;
 }
