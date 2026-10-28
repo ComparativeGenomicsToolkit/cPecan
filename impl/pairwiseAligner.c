@@ -771,11 +771,17 @@ static void diagonalCalculationExpectations(StateMachine *sM, int64_t xay, DpMat
 ///////////////////////////////////
 ///////////////////////////////////
 
+// The intrinsics below are x86 only.  Checking the target as well as the feature macros matters
+// on ARM, where cactus defines __AVX2__ itself (for abPOA's SIMDe) and the real headers do not exist.
+#if defined(__x86_64__) || defined(__i386__)
 #if defined(__SSE2__)
+#define PAIR_HMM_X86_SSE2
 #include <xmmintrin.h>
 #endif
 #if defined(__AVX2__)
+#define PAIR_HMM_X86_AVX2
 #include <immintrin.h>
+#endif
 #endif
 
 #define PAIR_HMM_MAX_STATES 5
@@ -1221,7 +1227,7 @@ static void fastDiagonal_emissions(PairHmm *hmm, int64_t type, FastSymbols *symb
     // is off its end.  cX[i] is X[x0 - 1 + lo + i] and cY[i] is Y[y0 - 1 - lo - i].
     const uint8_t *restrict cX = type != PAIR_HMM_GAP_Y ? symbols->x + (x0 - 1 + lo) : NULL;
     const uint8_t *restrict cY = type != PAIR_HMM_GAP_X ? symbols->yReversed + (symbols->lY - y0 + lo) : NULL;
-#if defined(__AVX2__)
+#if defined(PAIR_HMM_X86_AVX2)
     // Table lookups the compiler will not vectorise on its own
     __m256d vScale = _mm256_set1_pd(scale);
     __m128i vSymbols = _mm_set1_epi32(SYMBOL_NUMBER);
@@ -1422,10 +1428,15 @@ static bool getPosteriorProbsWithBandingFast(StateMachine *sM, stList *anchorPai
     }
     int64_t ns = hmm.stateNumber;
 
-#if defined(__SSE2__)
+#if defined(PAIR_HMM_X86_SSE2)
     // Cells far off the alignment decay towards zero; flush them rather than crawl through denormals
     unsigned int oldCsr = _mm_getcsr();
     _mm_setcsr(oldCsr | 0x8040); // flush-to-zero and denormals-are-zero
+#elif defined(__aarch64__)
+    // Same on ARM (FPCR.FZ covers inputs and outputs), which also keeps results the same as x86
+    uint64_t oldFpcr;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(oldFpcr));
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(oldFpcr | (UINT64_C(1) << 24)));
 #endif
 
     Band *band = p->dynamicAnchorExpansion ? band_constructDynamic(anchorPairs, sX.length, sY.length) :
@@ -1536,8 +1547,10 @@ static bool getPosteriorProbsWithBandingFast(StateMachine *sM, stList *anchorPai
         free(backCells[i]);
     }
     band_destruct(band);
-#if defined(__SSE2__)
+#if defined(PAIR_HMM_X86_SSE2)
     _mm_setcsr(oldCsr);
+#elif defined(__aarch64__)
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(oldFpcr));
 #endif
     return 1;
 }
